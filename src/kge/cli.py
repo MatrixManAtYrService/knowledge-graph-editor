@@ -76,17 +76,35 @@ def _parse_data(data: str) -> dict:
 # -- serve --------------------------------------------------------------------
 
 
+def _packaged_ui() -> Path | None:
+    """The UI vendored inside this package (built ui/dist, committed), so
+    consumers installing kge as a git/pypi dependency get the browser UI
+    with no node toolchain."""
+    from importlib.resources import files
+
+    try:
+        candidate = Path(str(files("kge") / "ui_dist"))
+    except Exception:
+        return None
+    return candidate if (candidate / "index.html").is_file() else None
+
+
 @app.command()
 def serve(
     graph_dir: Annotated[
         Path, typer.Option("--graph-dir", help="Directory holding the graph JSON files")
     ] = Path("graph"),
     ui_dir: Annotated[
-        Path | None, typer.Option("--ui-dir", help="Built UI to serve at / (default: ui/dist if present)")
+        Path | None,
+        typer.Option("--ui-dir", help="Built UI to serve at / (default: ./ui/dist, else the UI vendored in the package)"),
     ] = None,
     port: Annotated[int, typer.Option("--port", help="Server port")] = 8151,
 ) -> None:
-    """Run the kge server over a graph directory."""
+    """Run the kge server over a graph directory.
+
+    Creates an empty-but-valid graph directory if one doesn't exist, so a
+    fresh consumer repo can start with just `kge serve`.
+    """
     import uvicorn
 
     from kge.server import create_app
@@ -94,10 +112,12 @@ def serve(
 
     store = GraphStore(graph_dir.resolve())
     store.ensure()
-    if ui_dir is None and (Path("ui") / "dist" / "index.html").is_file():
-        ui_dir = Path("ui") / "dist"
+    if ui_dir is None:
+        local = Path("ui") / "dist"
+        ui_dir = local if (local / "index.html").is_file() else _packaged_ui()
     console.print(f"graph dir: {store.dir}")
-    console.print(f"ui: {ui_dir.resolve() if ui_dir else '(not built — API only)'}")
+    console.print(f"ui: {ui_dir.resolve() if ui_dir else '(none found — API only)'}")
+    console.print(f"open http://localhost:{port}")
     uvicorn.run(create_app(store, ui_dir), host="0.0.0.0", port=port, log_level="warning")
 
 

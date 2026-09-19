@@ -4,7 +4,33 @@ A knowledge graph collaboratively edited by humans (browser UI) and agents
 (CLI). The source of truth is JSON files checked into this repo; a small
 server loads them and serves the whole graph to both kinds of client.
 
-## Quick start
+## Use it from your own repo (no clone, no node, no nix)
+
+kge is consumable as a git dependency: your repo holds only your graph data,
+and the tool — server, CLI, *and* the browser UI, which is vendored into the
+Python package as static files — comes from GitHub. In your repo:
+
+```toml
+# pyproject.toml
+[project]
+name = "my-graph"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["kge"]
+
+[tool.uv.sources]
+kge = { git = "https://github.com/MatrixManAtYrService/knowledge-graph-editor" }
+```
+
+```bash
+uv run kge serve            # seeds ./graph if missing; UI at http://localhost:8151
+```
+
+The only prerequisites are uv and Python 3.12+. See the
+[demo repo](https://github.com/MatrixManAtYrService/knowledge-graph-editor-demo)
+for a working example.
+
+## Developing kge itself
 
 ```bash
 nix develop                 # provides uv, node, pnpm
@@ -113,6 +139,14 @@ uv run kge serve                 # backend + built UI
 cd ui && pnpm dev                # UI dev server on :5173, /api proxied to :8151
 nix build .#ui                   # hermetic UI build (native nixpkgs pnpm)
 nix flake check                  # build check
+```
+
+After changing the UI, regenerate the vendored copy that git-dependency
+consumers receive (`src/kge/ui_dist/` is committed on purpose — pip/uv build
+the wheel straight from the git checkout, where no node toolchain exists):
+
+```bash
+cd ui && pnpm build && rm -rf ../src/kge/ui_dist && cp -r dist ../src/kge/ui_dist
 ```
 
 See `research-layout-persistence.md` for the prior-art survey behind the
