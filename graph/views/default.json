@@ -1,0 +1,49 @@
+{
+  "id": "default",
+  "name": "Default",
+  "visibleNodeTypes": null,
+  "visibleEdgeTypes": null,
+  "nodeOverrides": [],
+  "edgeOverrides": [],
+  "focus": {
+    "node": "task:nightly.generate_invoices",
+    "kHops": 2
+  },
+  "focusShow": [
+    "service:billing",
+    "endpoint:billing:v1/refund"
+  ],
+  "focusHide": [],
+  "layout": {
+    "engine": "fcose",
+    "seedPositions": {
+      "endpoint:billing:v1/refund": {
+        "x": -247.57754590335972,
+        "y": 14.762036656471949
+      },
+      "service:billing": {
+        "x": -161.7397456784425,
+        "y": -45.535471173049494
+      },
+      "table:billing.invoice": {
+        "x": 38.79489087310108,
+        "y": -90.59210480770521
+      }
+    },
+    "pinned": [],
+    "skewers": {
+      "skewer:invoice-flow": {
+        "a": {
+          "x": 76.0611991738929,
+          "y": 120.32755097608921
+        },
+        "b": {
+          "x": 63.70645681546589,
+          "y": -123.1756267166567
+        },
+        "pinned": false
+      }
+    },
+    "rules": []
+  }
+}

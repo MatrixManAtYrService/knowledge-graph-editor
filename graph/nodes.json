@@ -1,0 +1,42 @@
+{
+  "nodes": [
+    {
+      "id": "endpoint:billing:v1/invoice",
+      "type": "endpoint",
+      "label": "v1/invoice",
+      "data": {}
+    },
+    {
+      "id": "endpoint:billing:v1/refund",
+      "type": "endpoint",
+      "label": "v1/refund",
+      "data": {}
+    },
+    {
+      "id": "service:billing",
+      "type": "service",
+      "label": "billing",
+      "data": {}
+    },
+    {
+      "id": "skewer:invoice-flow",
+      "type": "skewer",
+      "label": "invoice flow",
+      "data": {}
+    },
+    {
+      "id": "table:billing.invoice",
+      "type": "table",
+      "label": "billing.invoice",
+      "data": {}
+    },
+    {
+      "id": "task:nightly.generate_invoices",
+      "type": "task",
+      "label": "generate_invoices",
+      "data": {
+        "foo": "bar"
+      }
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "edges": [
+    {
+      "type": "HANDLES",
+      "from": "service:billing",
+      "to": "endpoint:billing:v1/invoice",
+      "data": {
+        "note": "InvoiceController.java:42"
+      }
+    },
+    {
+      "type": "HANDLES",
+      "from": "service:billing",
+      "to": "endpoint:billing:v1/refund",
+      "data": {
+        "note": "RefundController.java:17"
+      }
+    },
+    {
+      "type": "WRITES",
+      "from": "service:billing",
+      "to": "table:billing.invoice",
+      "data": {
+        "note": "InvoiceDao.java:118"
+      }
+    },
+    {
+      "type": "skewer-order",
+      "from": "skewer:invoice-flow",
+      "to": "endpoint:billing:v1/invoice",
+      "data": {
+        "index": 1
+      }
+    },
+    {
+      "type": "skewer-order",
+      "from": "skewer:invoice-flow",
+      "to": "table:billing.invoice",
+      "data": {
+        "index": 2
+      }
+    },
+    {
+      "type": "skewer-order",
+      "from": "skewer:invoice-flow",
+      "to": "task:nightly.generate_invoices",
+      "data": {
+        "index": 0
+      }
+    },
+    {
+      "type": "CALLS",
+      "from": "task:nightly.generate_invoices",
+      "to": "endpoint:billing:v1/invoice",
+      "data": {
+        "note": "invoicing.py:14",
+        "foo": "bar"
+      }
+    }
+  ]
+}

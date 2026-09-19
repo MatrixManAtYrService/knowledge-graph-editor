@@ -1,0 +1,56 @@
+{
+  "nodeTypes": {
+    "service": {
+      "color": "#4e79a7",
+      "description": "A deployed service",
+      "family": "runtime"
+    },
+    "endpoint": {
+      "color": "#f28e2c",
+      "description": "An HTTP endpoint",
+      "family": "runtime"
+    },
+    "table": {
+      "color": "#59a14f",
+      "description": "A database table",
+      "family": "storage"
+    },
+    "task": {
+      "color": "#e15759",
+      "description": "A scheduled task",
+      "family": "runtime"
+    },
+    "skewer": {
+      "color": "#9aa0a6",
+      "description": "An ordered colinearity group (layout intent, interpreted by the view)",
+      "family": "layout"
+    }
+  },
+  "edgeTypes": {
+    "CALLS": {
+      "color": "#b07aa1",
+      "description": "Caller invokes callee",
+      "family": "flow"
+    },
+    "HANDLES": {
+      "color": "#76b7b2",
+      "description": "Handler serves an endpoint",
+      "family": "flow"
+    },
+    "READS": {
+      "color": "#59a14f",
+      "description": "Reads from a table",
+      "family": "storage"
+    },
+    "WRITES": {
+      "color": "#edc948",
+      "description": "Writes to a table",
+      "family": "storage"
+    },
+    "skewer-order": {
+      "color": "#c9cdd2",
+      "description": "Skewer membership; data.index gives the order along the skewer",
+      "family": "layout"
+    }
+  }
+}
