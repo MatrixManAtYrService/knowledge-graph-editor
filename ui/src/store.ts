@@ -11,7 +11,19 @@
 
 import { create } from 'zustand'
 import { fetchGraph, postSelection, putGraph } from './api'
-import { SKEWER_EDGE, SKEWER_TYPE } from './graph'
+import {
+  alignGeom,
+  computeBundleFracs,
+  groupOpts,
+  LANE_GAP,
+  padScale,
+  SKEWER_EDGE,
+  SKEWER_TYPE,
+  skewerShown,
+  skewersOf,
+  snapLanes,
+  visibleSets,
+} from './graph'
 import type { Focus, GraphPayload, Position, Sel, SkewerGeom, View } from './types'
 import { edgeKey } from './types'
 
@@ -50,6 +62,13 @@ export interface KgeState {
 
   setTypesChecked: (kind: 'node' | 'edge', names: string[], checked: boolean) => void
   toggleOverride: (kind: 'node' | 'edge', id: string) => void
+  setSkewersEnabled: (ids: string[], enabled: boolean) => void
+  setBundleAlign: (group: string, on: boolean) => void
+  applyBundleSpacing: (group: string, mode: 'even' | 'order' | 'proportional') => void
+  equalizeBundle: (group: string) => void
+  rotateBundle: (group: string) => void
+  padBundle: (group: string) => void
+  setMemberFrac: (skewerId: string, nodeId: string, frac: number) => void
   setWalkMode: (on: boolean) => void
   setFocusHops: (k: number) => void
   clearFocus: () => void
@@ -308,6 +327,175 @@ export const useStore = create<KgeState>((set, get) => {
         const cur = v[field] ?? []
         v[field] = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]
       })
+    },
+
+    /** Enable/disable skewers (their rails) without touching their members:
+     * flips each skewer's own inclusion checkbox to the requested state. */
+    setSkewersEnabled: (ids, enabled) => {
+      mut((_g, v) => {
+        const overrides = new Set(v.nodeOverrides ?? [])
+        for (const id of ids) {
+          if (skewerShown(v, id) === enabled) continue
+          if (overrides.has(id)) overrides.delete(id)
+          else overrides.add(id)
+        }
+        v.nodeOverrides = [...overrides]
+      })
+    },
+
+    setBundleAlign: (group, on) => {
+      mut((g, v) => {
+        const cur = v.skewerGroups?.[group] ?? { align: false, axis: null }
+        v.skewerGroups = { ...(v.skewerGroups ?? {}), [group]: { ...cur, align: on } }
+        // Turning align on conforms the bundle now: every enabled rail takes
+        // the reference's segment (a pinned rail if there is one, else the
+        // highest-priority one), keeping only its own sideways offset.
+        if (!on) return
+        const rails = skewersOf(g).filter((s) => s.group === group && skewerShown(v, s.id))
+        const geoms = rails
+          .map((s) => ({ id: s.id, geom: v.layout.skewers[s.id] }))
+          .filter((x): x is { id: string; geom: SkewerGeom } => Boolean(x.geom))
+        const ref = geoms.find((x) => x.geom.pinned) ?? geoms[0]
+        if (!ref) return
+        for (const { id, geom } of geoms) {
+          if (id === ref.id || geom.pinned) continue
+          v.layout.skewers[id] = alignGeom(ref.geom, geom)
+        }
+      })
+    },
+
+    /** Bake member spacing for a bundle: 'order' = merged-rank even spacing,
+     * 'proportional' = value-true fractions (records the axis range),
+     * 'even' = clear the baked fractions. One-shot — drag things afterwards. */
+    applyBundleSpacing: (group, mode) => {
+      let note = ''
+      mut((g, v) => {
+        const rails = skewersOf(g).filter((s) => s.group === group)
+        const fracs = (v.layout.memberFracs ??= {})
+        const cur = v.skewerGroups?.[group] ?? { align: false, axis: null }
+        if (mode === 'even') {
+          for (const s of rails) delete fracs[s.id]
+          v.skewerGroups = { ...(v.skewerGroups ?? {}), [group]: { ...cur, axis: null } }
+          note = `${group}: members spaced evenly per skewer`
+          return
+        }
+        const res = computeBundleFracs(g, group, mode)
+        if (!Object.keys(res.byRail).length) {
+          note =
+            mode === 'proportional'
+              ? `${group}: no members have values that parse as numbers or dates`
+              : `${group}: no members carry the ordering key`
+          return
+        }
+        for (const s of rails) {
+          if (res.byRail[s.id]) fracs[s.id] = res.byRail[s.id]
+          else delete fracs[s.id]
+        }
+        v.skewerGroups = {
+          ...(v.skewerGroups ?? {}),
+          [group]: { ...cur, axis: mode === 'proportional' ? res.axis : null },
+        }
+        note =
+          `${group}: applied ${mode === 'order' ? 'shared order' : 'proportional order'}` +
+          (res.skipped.length ? ` (skipped, missing values: ${res.skipped.join(', ')})` : '')
+      })
+      if (note) set({ status: note })
+    },
+
+    /** One member's hand-placed rail fraction (dragging a node slides it
+     * along its owning rail). Baked like the spacing actions' output. */
+    setMemberFrac: (skewerId, nodeId, frac) => {
+      mut(
+        (_g, v) => {
+          const fracs = (v.layout.memberFracs ??= {})
+          fracs[skewerId] = { ...(fracs[skewerId] ?? {}), [nodeId]: frac }
+        },
+        { rebuild: false },
+      )
+    },
+
+    /** Snap the bundle's enabled rails onto an equidistant perpendicular
+     * grid, keeping their order (a pinned rail anchors the grid). */
+    equalizeBundle: (group) => {
+      mut((g, v) => {
+        const entries = skewersOf(g)
+          .filter((s) => s.group === group && skewerShown(v, s.id))
+          .map((s) => ({ id: s.id, geom: v.layout.skewers[s.id] }))
+          .filter((x): x is { id: string; geom: SkewerGeom } => Boolean(x.geom))
+        Object.assign(v.layout.skewers, snapLanes(entries, LANE_GAP))
+      })
+      set({ status: `${group}: rails snapped to equidistant lanes` })
+    },
+
+    /** Stretch the bundle's rails (about their midpoints) until neighboring
+     * dots and labels clear each other at the current member fractions.
+     * Under align every rail takes the bundle's worst-case factor so the
+     * ends stay colinear. Capped at 8× — near-coincident members can't be
+     * fixed by stretching (slide them, or re-space). */
+    padBundle: (group) => {
+      let note = ''
+      mut((g, v) => {
+        const { nodes: visN } = visibleSets(g, v)
+        const byId = new Map(g.nodes.map((n) => [n.id, n]))
+        const memberOf = new Map<string, string>()
+        for (const s of skewersOf(g)) {
+          for (const m of s.members) if (!memberOf.has(m)) memberOf.set(m, s.id)
+        }
+        const entries: { id: string; geom: SkewerGeom; scale: number }[] = []
+        for (const s of skewersOf(g)) {
+          if (s.group !== group || !skewerShown(v, s.id)) continue
+          const geom = v.layout.skewers[s.id]
+          if (!geom) continue
+          const mine = s.members.filter((m) => visN.has(m) && memberOf.get(m) === s.id)
+          const fr = v.layout.memberFracs?.[s.id]
+          const ts = mine.map((m, i) => fr?.[m] ?? (i + 0.5) / mine.length)
+          const labels = mine.map((m) => byId.get(m)?.label || m)
+          entries.push({ id: s.id, geom, scale: padScale(geom, labels, ts) })
+        }
+        if (!entries.length) return
+        const aligned = groupOpts(v, group).align
+        const shared = Math.max(...entries.map((e) => e.scale))
+        let applied = 1
+        for (const e of entries) {
+          const k = Math.min(aligned ? shared : e.scale, 8)
+          if (k <= 1.001) continue
+          applied = Math.max(applied, k)
+          const mid = { x: (e.geom.a.x + e.geom.b.x) / 2, y: (e.geom.a.y + e.geom.b.y) / 2 }
+          v.layout.skewers[e.id] = {
+            a: { x: mid.x + (e.geom.a.x - mid.x) * k, y: mid.y + (e.geom.a.y - mid.y) * k },
+            b: { x: mid.x + (e.geom.b.x - mid.x) * k, y: mid.y + (e.geom.b.y - mid.y) * k },
+            pinned: e.geom.pinned,
+          }
+        }
+        note =
+          applied > 1
+            ? `${group}: rails stretched ${applied.toFixed(1)}× for label clearance`
+            : `${group}: labels already clear`
+      })
+      if (note) set({ status: note })
+    },
+
+    /** Turn the whole bundle a quarter turn about its center — an explicit
+     * action, so pinned rails turn too. */
+    rotateBundle: (group) => {
+      mut((g, v) => {
+        const geoms = skewersOf(g)
+          .filter((s) => s.group === group && skewerShown(v, s.id))
+          .map((s) => ({ id: s.id, geom: v.layout.skewers[s.id] }))
+          .filter((x): x is { id: string; geom: SkewerGeom } => Boolean(x.geom))
+        if (!geoms.length) return
+        const mids = geoms.map(({ geom }) => ({
+          x: (geom.a.x + geom.b.x) / 2,
+          y: (geom.a.y + geom.b.y) / 2,
+        }))
+        const cx = mids.reduce((s, m) => s + m.x, 0) / mids.length
+        const cy = mids.reduce((s, m) => s + m.y, 0) / mids.length
+        const turn = (p: Position): Position => ({ x: cx - (p.y - cy), y: cy + (p.x - cx) })
+        for (const { id, geom } of geoms) {
+          v.layout.skewers[id] = { a: turn(geom.a), b: turn(geom.b), pinned: geom.pinned }
+        }
+      })
+      set({ status: `${group}: rotated 90°` })
     },
 
     addToSkewer: (skewerId, nodeId) => {

@@ -9,6 +9,13 @@ export interface TypeDef {
 export interface GraphSchema {
   nodeTypes: Record<string, TypeDef>
   edgeTypes: Record<string, TypeDef>
+  /** Bind node color to a node-data field, dataset-wide: nodes sharing a
+   * value of data[colorKey] share a color, overriding their type color
+   * (nodes without the field keep it). colorValues pins specific values;
+   * others get stable palette picks. Declared by whoever seeds the data —
+   * an author, a component, a status: the semantics are the caller's. */
+  colorKey?: string
+  colorValues?: Record<string, string>
 }
 
 export interface NodeT {
@@ -47,12 +54,39 @@ export interface LayoutHints {
   seedPositions: Record<string, Position>
   pinned: string[]
   skewers: Record<string, SkewerGeom>
+  /** Baked member placement: skewer id -> member id -> fraction along the
+   * rail. Written by the bundle spacing actions (shared order / proportional
+   * order); absent members and absent rails space evenly. Optional so old
+   * payloads still parse. */
+  memberFracs?: Record<string, Record<string, number>>
   rules: unknown[]
 }
 
 export interface Focus {
   node: string
   kHops: number
+}
+
+/** The value range a proportional-order application mapped onto the rails —
+ * what the floating axis labels. */
+export interface AxisInfo {
+  min: number
+  max: number
+  isDate: boolean
+}
+
+/** Per-view options for one bundle of skewers (skewers sharing a data.group
+ * name, which defaults to their data.orderKey — the member-data field the
+ * order reflects, e.g. "date"). Spacing itself is not an option here: the
+ * spacing ACTIONS bake fractions into layout.memberFracs, which the user is
+ * then free to drag around. */
+export interface SkewerGroupOpts {
+  /** The one live constraint: rails share a direction and their starts/ends
+   * stay colinear (aligned lanes) — dragging or stretching one rail moves
+   * them all, each keeping only its sideways offset. */
+  align: boolean
+  /** Set while proportional order is applied; drawn as the floating axis. */
+  axis?: AxisInfo | null
 }
 
 export interface View {
@@ -70,6 +104,10 @@ export interface View {
    * focus recenter — the hop algorithm recomputes from scratch. */
   focusShow: string[] // node ids or edge keys
   focusHide: string[]
+  /** Bundle options, keyed by the skewers' data.group (default: their
+   * data.orderKey). Optional so payloads saved before this field existed
+   * still parse. */
+  skewerGroups?: Record<string, SkewerGroupOpts>
   layout: LayoutHints
 }
 

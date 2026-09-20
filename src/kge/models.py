@@ -21,6 +21,13 @@ class TypeDef(BaseModel):
 class GraphSchema(BaseModel):
     nodeTypes: dict[str, TypeDef] = {}
     edgeTypes: dict[str, TypeDef] = {}
+    # Bind node color to a node-data field, dataset-wide: nodes sharing a
+    # value of data[colorKey] share a color, overriding their type color
+    # (nodes without the field keep it). colorValues pins specific values;
+    # others get stable palette picks in the UI. What the field means is the
+    # data author's business — an author, a component, a status.
+    colorKey: str = ""
+    colorValues: dict[str, str] = {}
 
 
 class Node(BaseModel):
@@ -67,12 +74,43 @@ class Layout(BaseModel):
     seedPositions: dict[str, Position] = {}
     pinned: list[str] = []
     skewers: dict[str, SkewerGeom] = {}  # skewer node id -> geometry
+    # Baked member placement: skewer id -> member id -> fraction along the
+    # rail (written by the UI's spacing actions; absentees space evenly).
+    memberFracs: dict[str, dict[str, float]] = {}
     rules: list[dict] = []  # reserved: type-scoped (SetCoLa-style) rules
 
 
 class Focus(BaseModel):
     node: str
     kHops: int = 2
+
+
+class AxisInfo(BaseModel):
+    """The value range a proportional-order application mapped onto the rails —
+    what the UI's floating axis labels."""
+
+    min: float
+    max: float
+    isDate: bool = False
+
+
+class SkewerGroupOpts(BaseModel):
+    """Per-view options for one bundle of skewers.
+
+    Skewers sharing a `data.group` name form a bundle; the name defaults to
+    their `data.orderKey` — the member-data field their order reflects (e.g.
+    "date"). Spacing is not an option here: the UI's spacing ACTIONS (shared
+    order / proportional order / even) bake fractions into
+    `layout.memberFracs`, and the user drags things around afterwards.
+
+    `align` is the one live constraint: rails share a direction and their
+    starts/ends stay colinear (aligned lanes) — moving or stretching one rail
+    moves them all, each keeping only its sideways offset. `axis` is set
+    while proportional order is applied and is drawn as the floating axis.
+    """
+
+    align: bool = False
+    axis: AxisInfo | None = None
 
 
 class View(BaseModel):
@@ -92,6 +130,8 @@ class View(BaseModel):
     # view's data. A focus recenter (walk step / hops change) clears both.
     focusShow: list[str] = []  # node ids or edge keys
     focusHide: list[str] = []
+    # Bundle options, keyed by the skewers' data.group (default: data.orderKey).
+    skewerGroups: dict[str, SkewerGroupOpts] = {}
     layout: Layout = Layout()
 
 
@@ -166,6 +206,11 @@ class Graph(BaseModel):
             lay.seedPositions = {k: p for k, p in lay.seedPositions.items() if k in node_ids}
             lay.pinned = [n for n in lay.pinned if n in node_ids]
             lay.skewers = {k: geom for k, geom in lay.skewers.items() if k in node_ids}
+            lay.memberFracs = {
+                k: {m: t for m, t in fr.items() if m in node_ids}
+                for k, fr in lay.memberFracs.items()
+                if k in node_ids
+            }
             v.nodeOverrides = [n for n in v.nodeOverrides if n in node_ids]
             v.edgeOverrides = [k for k in v.edgeOverrides if k in edge_keys]
             v.focusShow = [i for i in v.focusShow if i in node_ids or i in edge_keys]

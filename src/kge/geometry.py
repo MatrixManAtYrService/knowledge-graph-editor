@@ -127,18 +127,28 @@ def visible_sets(graph: Graph, view: View) -> tuple[set[str], list[Edge]]:
 
 
 def skewer_members(graph: Graph) -> dict[str, list[str]]:
-    """skewer id -> members ordered by skewer-order data.index."""
-    out: dict[str, list[str]] = {}
+    """skewer id -> members ordered by skewer-order data.index.
+
+    Dict order is ownership order (data.priority, then id) — the first skewer
+    claiming a shared member places it on its straight baseline; other rails
+    bend through it in the UI. Rail geometry here stays the straight baseline
+    segment, so collision results near bent rails are approximate.
+    """
+    rows: list[tuple[float, str, list[str]]] = []
     for n in graph.nodes:
         if n.type != SKEWER_TYPE:
             continue
-        rows = [
+        pairs = [
             (e.data.get("index", i), e.dst)
             for i, e in enumerate(graph.edges)
             if e.type == SKEWER_EDGE and e.src == n.id
         ]
-        out[n.id] = [dst for _, dst in sorted(rows)]
-    return out
+        prio = n.data.get("priority", 50)
+        if not isinstance(prio, (int, float)):
+            prio = 50
+        rows.append((float(prio), n.id, [dst for _, dst in sorted(pairs)]))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return {sid: members for _, sid, members in rows}
 
 
 def _default_geom(members: list[str], seed: dict[str, Any]) -> SkewerGeom:
@@ -169,15 +179,18 @@ def view_geometry(
     seed = view.layout.seedPositions
     skewer_type_checked = view.visibleNodeTypes is None or SKEWER_TYPE in view.visibleNodeTypes
 
+    def skewer_hidden(sid: str) -> bool:
+        # Per-skewer interpretation: the skewer node's own tree checkbox
+        # (type checked XOR individually overridden).
+        return skewer_type_checked == (sid in view.nodeOverrides)
+
     positions: dict[str, Vec] = {}
     rails: dict[str, Seg] = {}
     member_of: dict[str, str] = {}
     warnings: list[str] = []
 
     for sid, members in skewer_members(graph).items():
-        # Per-skewer interpretation: the skewer node's own tree checkbox
-        # (type checked XOR individually overridden).
-        if skewer_type_checked == (sid in view.nodeOverrides):
+        if skewer_hidden(sid):
             continue
         vis_members = [m for m in members if m in vis_nodes and m not in member_of]
         if not vis_members:
@@ -189,8 +202,11 @@ def view_geometry(
         b: Vec = (geom.b.x, geom.b.y)
         rails[sid] = (a, b)
         n = len(vis_members)
+        # Baked fractions (the UI's spacing actions write them into the view);
+        # members without one take their even slot.
+        sk_frac = view.layout.memberFracs.get(sid, {})
         for i, m in enumerate(vis_members):
-            t = (i + 0.5) / n
+            t = sk_frac.get(m, (i + 0.5) / n)
             positions[m] = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
 
     for nid in vis_nodes:

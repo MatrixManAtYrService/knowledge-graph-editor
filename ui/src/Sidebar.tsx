@@ -4,14 +4,19 @@
 // the canvas (two-slot selection), same as tapping it.
 
 import { useState } from 'react'
+import { positionsOf } from './GraphCanvas'
 import {
+  boundValue,
+  groupOpts,
   includedNodeIds,
+  nodeColor,
   peripheryDim,
   SKEWER_EDGE,
   SKEWER_TYPE,
   skewerShown,
   skewersOf,
   visibleSets,
+  type Skewer,
 } from './graph'
 import { useStore } from './store'
 import type { Sel, TypeDef, View } from './types'
@@ -266,6 +271,182 @@ function Tree({
   )
 }
 
+/** The skewers tree: one bundle per data.group (default: the ordering key),
+ * with enable checkboxes — a disabled skewer keeps its members on canvas,
+ * just not on a rail — and per-bundle presentation options. */
+function SkewerTree({ view, shownIds }: { view: View; shownIds: Set<string> }) {
+  const graph = useStore((s) => s.graph)!
+  const {
+    setSkewersEnabled,
+    setBundleAlign,
+    applyBundleSpacing,
+    equalizeBundle,
+    rotateBundle,
+    padBundle,
+    setPositions,
+    tapSelect,
+  } = useStore()
+  const [open, setOpen] = useState<Set<string>>(new Set())
+  const toggleOpen = (k: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev)
+      if (next.has(k)) next.delete(k)
+      else next.add(k)
+      return next
+    })
+
+  const bundles = new Map<string, Skewer[]>()
+  for (const s of skewersOf(graph)) {
+    const key = s.group ?? '(ungrouped)'
+    bundles.set(key, [...(bundles.get(key) ?? []), s])
+  }
+  if (!bundles.size) return <div className="tree-empty">no skewers yet</div>
+
+  /** Disabling rails frees their members: capture the rail-derived positions
+   * first so the nodes stay where they are instead of scattering. */
+  const setEnabled = (skewers: Skewer[], enabled: boolean) => {
+    if (!enabled) setPositions(positionsOf(skewers.flatMap((s) => s.members)))
+    setSkewersEnabled(skewers.map((s) => s.id), enabled)
+  }
+
+  return (
+    <>
+      {[...bundles.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, skewers]) => {
+        const real = skewers.some((s) => s.group !== null) // ungrouped bundles get no options
+        const opts = groupOpts(view, key)
+        const enabled = skewers.filter((s) => skewerShown(view, s.id))
+        const allOn = enabled.length === skewers.length
+        const isOpen = open.has(key)
+        return (
+          <div key={key} className="tree-family">
+            <div className="tree-row">
+              <Caret open={isOpen} onClick={() => toggleOpen(key)} />
+              <TriBox
+                checked={enabled.length > 0}
+                mixed={enabled.length > 0 && !allOn}
+                title="skewers enabled (members stay on canvas either way)"
+                onChange={() => setEnabled(skewers, !allOn)}
+              />
+              <span className="tree-label family-label">
+                {key} <span className="count">({skewers.length})</span>
+              </span>
+            </div>
+            {isOpen && (
+              <>
+                {skewers.map((s) => (
+                  <div key={s.id} className="tree-row tree-item">
+                    <input
+                      type="checkbox"
+                      checked={skewerShown(view, s.id)}
+                      title="enabled: members ride this rail — off: they float free"
+                      onChange={() => setEnabled([s], !skewerShown(view, s.id))}
+                    />
+                    <Eye state={shownIds.has(s.id) ? 'on' : 'off'} />
+                    <span
+                      className="tree-label item-label"
+                      title={s.id}
+                      onClick={() => tapSelect({ kind: 'skewer', id: s.id })}
+                    >
+                      {s.label}
+                    </span>
+                  </div>
+                ))}
+                {real && (
+                  <div className="skewer-opts">
+                    <label title="The bundle's rails share a direction and their starts/ends stay colinear — dragging or stretching one moves them all; each rail keeps only its sideways offset.">
+                      <input
+                        type="checkbox"
+                        checked={opts.align}
+                        onChange={() => setBundleAlign(key, !opts.align)}
+                      />
+                      align
+                    </label>
+                    <div className="skewer-actions">
+                      <button
+                        className="mini"
+                        title="Snap the rails onto evenly spaced lanes, keeping their order (a pinned rail anchors the grid)."
+                        onClick={() => equalizeBundle(key)}
+                      >
+                        make equidistant
+                      </button>
+                      <button
+                        className="mini"
+                        title="Turn the whole bundle a quarter turn about its center."
+                        onClick={() => rotateBundle(key)}
+                      >
+                        rotate 90°
+                      </button>
+                      <button
+                        className="mini"
+                        title="Stretch the rails just enough that neighboring dots and labels stay clear of each other."
+                        onClick={() => padBundle(key)}
+                      >
+                        add padding
+                      </button>
+                      <button
+                        className="mini"
+                        title="Each rail spaces its own members evenly along itself (the default)."
+                        onClick={() => applyBundleSpacing(key, 'even')}
+                      >
+                        space evenly per skewer
+                      </button>
+                      <button
+                        className="mini"
+                        title="Interleave members across the bundle in one merged order, evenly spaced — order carries across rails, durations carry no weight. Works with any sortable value."
+                        onClick={() => applyBundleSpacing(key, 'order')}
+                      >
+                        apply shared order
+                      </button>
+                      <button
+                        className="mini"
+                        title="Place members at their ordering-key value on one scale shared by the bundle — durations are literal, lulls are gaps, and a value axis is drawn. Needs numeric or date values."
+                        onClick={() => applyBundleSpacing(key, 'proportional')}
+                      >
+                        apply proportional order
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
+/** Passive legend for the schema's color binding (declared by whoever seeds
+ * the data, not toggled here): which data[colorKey] value wears which color. */
+function ColorLegend() {
+  const graph = useStore((s) => s.graph)!
+  const values = new Map<string, { color: string; count: number }>()
+  for (const n of graph.nodes) {
+    if (n.type === SKEWER_TYPE) continue
+    const value = boundValue(graph.schema, n)
+    if (value === null) continue
+    const cur = values.get(value)
+    if (cur) cur.count++
+    else values.set(value, { color: nodeColor(graph.schema, n, '#888'), count: 1 })
+  }
+  if (!values.size) return null
+  return (
+    <div className="section">
+      <h3>color: {graph.schema.colorKey}</h3>
+      {[...values.entries()]
+        .sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]))
+        .map(([value, { color, count }]) => (
+          <div key={value} className="tree-row">
+            <span className="dot" style={{ background: color }} />
+            <span className="tree-label">
+              {value} <span className="count">({count})</span>
+            </span>
+          </div>
+        ))}
+    </div>
+  )
+}
+
 export function Sidebar() {
   const graph = useStore((s) => s.graph)
   const walkMode = useStore((s) => s.walkMode)
@@ -345,6 +526,13 @@ export function Sidebar() {
         <h3>edges</h3>
         <Tree kind="edge" view={view} families={edgeFamilies} shownIds={shownIds} />
       </div>
+
+      <div className="section">
+        <h3>skewers</h3>
+        <SkewerTree view={view} shownIds={shownIds} />
+      </div>
+
+      <ColorLegend />
 
       <div className="section">
         <h3>click behavior</h3>

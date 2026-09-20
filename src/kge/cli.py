@@ -180,6 +180,11 @@ checked into git — the database is just what's in those files.
     node plus `skewer-order` edges (data.index gives the order). The UI
     draws them as a rail the members sit on. Create with `kge skewer`.
     Where a skewer sits on screen is per-view, not graph data.
+    Declaring `--order-key <field>` (the member-data field the order
+    reflects, e.g. a date) bundles skewers so the UI can align their rails
+    (shared direction, colinear ends), snap them into equidistant lanes,
+    and space members on one shared scale — by merged rank or by value with
+    a labeled axis; `--group <name>` splits bundles that share a key.
   - [bold]Views[/bold] are saved perspectives: which types/items are included, an
     optional k-hop focus with manual show/hide adjustments, and all layout
     geometry. `kge views` lists them; `kge views <id>` resolves one to
@@ -554,6 +559,23 @@ def skewer(
     skewer_id: Annotated[str, typer.Argument(help="Skewer node id (created if missing)")],
     members: Annotated[list[str], typer.Argument(help="Member node ids, in skewer order")],
     label: Annotated[str, typer.Option("--label", "-l")] = "",
+    order_key: Annotated[
+        str,
+        typer.Option(
+            "--order-key",
+            help="Member-data field the order reflects (e.g. 'date'); skewers "
+            "sharing one form a bundle the UI can keep parallel, space by "
+            "value, and draw an axis for",
+        ),
+    ] = "",
+    group: Annotated[
+        str,
+        typer.Option(
+            "--group",
+            help="Bundle name (defaults to the order key) — set it when "
+            "unrelated bundles happen to share an ordering key",
+        ),
+    ] = "",
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Create or replace a skewer: an ordered colinearity group stored in the graph.
@@ -577,9 +599,14 @@ def skewer(
     )
     node = next((n for n in g.nodes if n.id == skewer_id), None)
     if node is None:
-        g.nodes.append(Node(id=skewer_id, type="skewer", label=label, data={}))
+        node = Node(id=skewer_id, type="skewer", label=label, data={})
+        g.nodes.append(node)
     elif label:
         node.label = label
+    if order_key:
+        node.data["orderKey"] = order_key
+    if group:
+        node.data["group"] = group
     g.edges = [e for e in g.edges if not (e.type == "skewer-order" and e.src == skewer_id)]
     for i, m in enumerate(members):
         g.edges.append(

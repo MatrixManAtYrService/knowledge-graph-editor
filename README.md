@@ -65,6 +65,11 @@ uv run kge --help           # every subcommand has its own --help
 
 - `graph/schema.json` — node/edge type vocabulary: display color,
   description, and `family` (the grouping level above type in the UI tree).
+  Optionally `colorKey`, a node-data field that binds node color: nodes
+  sharing a value of `data[colorKey]` share a color, overriding their type
+  color (whatever the field means to your data — an author, a component, a
+  status). `colorValues` pins colors for specific values; the rest get
+  stable palette picks. The sidebar shows the resulting legend.
 - `graph/nodes.json`, `graph/edges.json` — the graph, sorted for stable
   diffs. Nodes: `{id, type, label, data}`. Edges: `{type, from, to, data}`
   (by convention `data.note` carries `file:line` evidence).
@@ -81,12 +86,58 @@ nodes on a shish-kebab spit:
 - **In each view** (presentation): the segment the members sit on — two
   endpoints (encoding position, angle, length) and a `pinned` flag.
 
-The UI never draws the raw skewer node. It renders a rail — gradient plus an
-arrowhead showing direction, the name in a bulb at the base — and spaces the
-*visible* members evenly along it, so filtering compacts a skewer instantly
-while preserving its order and angle. Drag a member to move the whole
-skewer; drag an end handle to rotate or stretch it. Edges between members of
-one skewer draw as arcs so they stay legible off the rail.
+The UI never draws the raw skewer node. It renders a rail — a light→dark
+chain ending in an arrowhead, the name in a bulb at the base — that threads
+through its members *in order*. A node can sit on several skewers: exactly
+one (the lowest `data.priority`, then id order) **owns** it and spaces it
+evenly along its straight baseline; every other rail through it bends at
+its actual position, tube-map style. Filtering compacts a rail instantly
+while preserving its order. Three drags do three things: drag the **rail**
+to move the whole skewer, drag an **end handle** to rotate or stretch the
+baseline, and drag a **member** to slide it along the rail — hand-placement
+that is baked like the spacing actions' output and clamped between its rail
+neighbors, so the stored order stays true. Edges between members of one
+skewer draw as arcs so they stay legible off the rail.
+
+### Skewer bundles
+
+A skewer may declare `data.orderKey` — the member-data field its order
+reflects (a date, a version, any number: `kge skewer ... --order-key date`).
+Skewers sharing a key form a **bundle** (set `data.group` to split unrelated
+bundles that happen to share a key). The sidebar's **skewers** section lists
+bundles and lets you enable/disable rails singly or as a bundle — disabled
+rails release their members to float free, the nodes themselves stay — plus
+three per-bundle, per-view options:
+
+Below the rails sit one live constraint and a row of one-shot arrangement
+actions — apply one, then drag things wherever you like; changing course
+means applying a different action, not unchecking a box:
+
+- **align** (checkbox, the one live constraint) — the bundle's rails share
+  a direction and their starts and ends stay colinear; dragging or
+  stretching one rail moves them all, each keeping only its sideways lane
+  offset.
+- **make equidistant** — snap the rails onto evenly spaced lanes, keeping
+  their order (a pinned rail anchors the grid).
+- **rotate 90°** — turn the whole bundle a quarter turn about its center.
+- **add padding** — stretch the rails just enough that neighboring dots and
+  labels stay clear of each other at the current member spacing (measured
+  from the actual label widths; under align the whole bundle takes the
+  worst-case stretch so the ends stay colinear).
+- **space evenly per skewer** — each rail spaces its own members evenly
+  along itself (the default placement).
+- **apply shared order** — members interleave across the bundle in one
+  merged ordering, evenly spaced: order carries across rails, durations
+  carry no weight. Works with any sortable value (strings included).
+- **apply proportional order** — members sit at their key value on one
+  scale shared by the whole bundle: durations are literal, a lull on one
+  rail (while activity ran elsewhere) is a visible gap, and a floating axis
+  labels the values at the ends and at round intervals between. Needs
+  values that parse as numbers or dates.
+
+The spacing actions bake per-member rail fractions into the view
+(`layout.memberFracs`); dragging and filtering never recompute them —
+re-apply an action (or "space evenly per skewer") to re-derive.
 
 ## Views
 
@@ -115,12 +166,23 @@ selection, dotted grey ring = secondary, red crosshairs = focus center.
 ## Layout
 
 **Random layout** runs three trials — fcose over a quotient graph in which
-each skewer is one long thin rigid node, from three random starts — then
+each skewer is one long thin rigid node (and each **aligned bundle** is one
+rigid block), from three random starts — then
 de-collides each result (edges swing around obstacles by angle, nodes and
 rails separate, incident edges spread to share the full circle, over-long
 edges contract while the score tolerates it), scores them (collisions, then
 crossings), and shows the best. Click again to re-roll; pin what you like
 and re-roll the rest. Pinned nodes and skewers never move.
+
+Inside an aligned bundle the layout is lane-aware: rails sit equidistant,
+and their order is searched (a few shuffles per trial, scored by how many
+rails the bundle's own edges cross without terminating there), so heavily
+connected rails become neighbors. Free nodes that connect into the bundle
+are tried at every gap — outside the first rail, between each pair, outside
+the last — and take the gap whose edges cross the fewest rails, interleaving
+between the rails they connect (least-bad wins when zero crossings is
+impossible). Nodes with no edge into the bundle are kept out of the band
+entirely. A pinned rail anchors the whole grid.
 
 ## Selection is shared
 

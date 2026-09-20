@@ -6,7 +6,15 @@
 // skewer node, but renders a rail segment and places the visible members
 // evenly along it, so hiding members compacts the skewer for free.
 
-import type { GraphPayload, Position, SkewerGeom, View } from './types'
+import type {
+  AxisInfo,
+  GraphPayload,
+  GraphSchema,
+  Position,
+  SkewerGeom,
+  SkewerGroupOpts,
+  View,
+} from './types'
 import { edgeKey } from './types'
 
 export const SKEWER_TYPE = 'skewer'
@@ -16,8 +24,17 @@ export interface Skewer {
   id: string
   label: string
   members: string[] // ordered by skewer-order data.index
+  priority: number // lower claims shared members first (owner spaces them on its baseline)
+  orderKey: string | null // member-data field the order reflects (e.g. 'date')
+  /** Bundle name (data.group), defaulting to the orderKey: the unit that the
+   * sidebar groups by and that parallel/spaced/axis options apply to. Two
+   * unrelated bundles may share an ordering key by declaring distinct groups. */
+  group: string | null
 }
 
+/** Skewers in ownership order: a node shared by several is *owned* (placed on
+ * the straight baseline) by the first; the others' rails bend through it.
+ * Set data.priority on a skewer node to make its rail the straight one. */
 export function skewersOf(g: GraphPayload): Skewer[] {
   const out: Skewer[] = []
   for (const n of g.nodes) {
@@ -29,9 +46,19 @@ export function skewersOf(g: GraphPayload): Skewer[] {
         idx: typeof e.data.index === 'number' ? (e.data.index as number) : i,
       }))
       .sort((x, y) => x.idx - y.idx)
-    out.push({ id: n.id, label: n.label || n.id, members: rows.map((r) => r.id) })
+    const priority = typeof n.data.priority === 'number' ? (n.data.priority as number) : 50
+    const orderKey = typeof n.data.orderKey === 'string' && n.data.orderKey ? n.data.orderKey : null
+    const group = typeof n.data.group === 'string' && n.data.group ? n.data.group : orderKey
+    out.push({
+      id: n.id,
+      label: n.label || n.id,
+      members: rows.map((r) => r.id),
+      priority,
+      orderKey,
+      group,
+    })
   }
-  return out
+  return out.sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id))
 }
 
 /** Is this specific skewer interpreted in this view? (Its own checkbox in the
@@ -39,6 +66,302 @@ export function skewersOf(g: GraphPayload): Skewer[] {
 export function skewerShown(v: View, skewerId: string): boolean {
   const base = v.visibleNodeTypes === null || v.visibleNodeTypes.includes(SKEWER_TYPE)
   return (v.nodeOverrides ?? []).includes(skewerId) ? !base : base
+}
+
+/** This view's options for one bundle (all off when unset). */
+export function groupOpts(v: View, key: string): SkewerGroupOpts {
+  return v.skewerGroups?.[key] ?? { align: false, axis: null }
+}
+
+/** A member's ordering value as a number: numbers pass through, ISO-ish date
+ * strings become epoch millis, other numeric strings parse. Null = no value. */
+export function parseOrderValue(raw: unknown): { t: number; isDate: boolean } | null {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return { t: raw, isDate: false }
+  if (typeof raw !== 'string' || !raw) return null
+  if (/^\d{4}-\d{2}(-\d{2})?([T ].*)?$/.test(raw)) {
+    const ms = Date.parse(raw.length === 7 ? `${raw}-01` : raw)
+    return Number.isNaN(ms) ? null : { t: ms, isDate: true }
+  }
+  const n = Number(raw)
+  return Number.isFinite(n) ? { t: n, isDate: false } : null
+}
+
+// Spaced members stay a little off the rail ends (the bulb and the arrow).
+const SPACED_PAD = 0.06
+
+export interface BundleFracs {
+  byRail: Record<string, Record<string, number>> // skewer id -> member -> fraction
+  axis: AxisInfo | null // proportional mode only: the range the fractions map
+  skipped: string[] // rails left even-spaced (a member had no usable value)
+}
+
+/** Bake shared spacing for one bundle from the graph data — ALL members, not
+ * just visible ones: the result persists in the view, and a hidden member
+ * simply leaves its gap. mode 'order': even spacing by rank in the merged
+ * bundle-wide ordering (numeric order when every value parses, else plain
+ * string order — ISO dates sort right either way; ids break ties). mode
+ * 'proportional': value-true fractions on the bundle-global range (needs
+ * numbers or dates; also yields the axis info). Rails with an unvalued
+ * member are skipped — even spacing beats a half-true scale — though their
+ * valued members still hold their place on the shared scale. */
+export function computeBundleFracs(
+  g: GraphPayload,
+  group: string,
+  mode: 'order' | 'proportional',
+): BundleFracs {
+  const byId = new Map(g.nodes.map((n) => [n.id, n]))
+  const rails = skewersOf(g).filter((s) => s.group === group && s.orderKey)
+  interface Val {
+    m: string
+    raw: string | number
+    num: number | null
+    isDate: boolean
+  }
+  const pool = new Map<string, Val>() // deduped: a node shared by two rails is one event
+  const perRail: { id: string; members: string[] | null }[] = []
+  for (const s of rails) {
+    let complete = s.members.length > 0
+    const mine: string[] = []
+    for (const m of s.members) {
+      const raw = byId.get(m)?.data?.[s.orderKey!]
+      if ((typeof raw !== 'string' && typeof raw !== 'number') || raw === '') {
+        complete = false
+        continue
+      }
+      const parsed = parseOrderValue(raw)
+      if (mode === 'proportional' && !parsed) {
+        complete = false
+        continue
+      }
+      pool.set(m, { m, raw, num: parsed?.t ?? null, isDate: parsed?.isDate ?? false })
+      mine.push(m)
+    }
+    perRail.push({ id: s.id, members: complete ? mine : null })
+  }
+  const skipped = perRail.filter((p) => !p.members).map((p) => p.id)
+  if (!pool.size) return { byRail: {}, axis: null, skipped }
+
+  const frac = new Map<string, number>()
+  let axis: AxisInfo | null = null
+  const vals = [...pool.values()]
+  if (mode === 'proportional') {
+    const min = Math.min(...vals.map((x) => x.num!))
+    const max = Math.max(...vals.map((x) => x.num!))
+    axis = { min, max, isDate: vals.filter((x) => x.isDate).length >= vals.length / 2 }
+    const span = max - min
+    for (const x of vals) {
+      frac.set(x.m, span === 0 ? 0.5 : SPACED_PAD + ((x.num! - min) / span) * (1 - 2 * SPACED_PAD))
+    }
+  } else {
+    const allNum = vals.every((x) => x.num !== null)
+    vals.sort((a, b) => {
+      const cmp = allNum
+        ? a.num! - b.num!
+        : String(a.raw) < String(b.raw)
+          ? -1
+          : String(a.raw) > String(b.raw)
+            ? 1
+            : 0
+      return cmp || a.m.localeCompare(b.m)
+    })
+    const denom = Math.max(vals.length - 1, 1)
+    vals.forEach((x, i) => {
+      frac.set(x.m, vals.length === 1 ? 0.5 : SPACED_PAD + (i / denom) * (1 - 2 * SPACED_PAD))
+    })
+  }
+  const byRail: Record<string, Record<string, number>> = {}
+  for (const p of perRail) {
+    if (!p.members) continue
+    byRail[p.id] = Object.fromEntries(p.members.map((m) => [m, frac.get(m)!]))
+  }
+  return { byRail, axis, skipped }
+}
+
+// -- label padding ---------------------------------------------------------------
+
+let measureCtx: CanvasRenderingContext2D | null | undefined
+function labelWidth(text: string): number {
+  if (measureCtx === undefined) {
+    measureCtx =
+      typeof document === 'undefined' ? null : document.createElement('canvas').getContext('2d')
+  }
+  if (!measureCtx) return text.length * 6.2
+  measureCtx.font = '11px Helvetica Neue, Helvetica, sans-serif' // the canvas node-label font
+  return measureCtx.measureText(text).width
+}
+
+const LABEL_CLEAR_H = 10 // breathing room between side-by-side labels
+const LABEL_CLEAR_V = 48 // dot radius + label offset + line height + gap, stacked
+
+/** The stretch factor that gives every adjacent member pair on this rail
+ * enough room that dots and labels stay clear of their neighbors, given the
+ * rail's fixed direction: labels are horizontal text below the dots, so a
+ * horizontal-ish rail needs the two half-label-widths side by side while a
+ * vertical-ish one just needs stacked line clearance — whichever the
+ * direction reaches cheaper. Pairs sharing a fraction can't be fixed by
+ * stretching and are ignored. */
+export function padScale(geom: SkewerGeom, labels: string[], ts: number[]): number {
+  const len = Math.hypot(geom.b.x - geom.a.x, geom.b.y - geom.a.y)
+  if (len < 1e-6 || labels.length < 2) return 1
+  const ang = angleOf(geom)
+  const ux = Math.abs(Math.cos(ang))
+  const uy = Math.abs(Math.sin(ang))
+  let scale = 1
+  for (let i = 0; i + 1 < labels.length; i++) {
+    const gap = Math.abs(ts[i + 1] - ts[i]) * len
+    if (gap < 1e-6) continue
+    const needH = (labelWidth(labels[i]) + labelWidth(labels[i + 1])) / 2 + LABEL_CLEAR_H
+    const need = Math.min(needH / Math.max(ux, 1e-6), LABEL_CLEAR_V / Math.max(uy, 1e-6))
+    scale = Math.max(scale, need / gap)
+  }
+  return scale
+}
+
+/** The rail fractions the view renders for one skewer's owned members: baked
+ * memberFracs where present (absent members take their even slot), else null
+ * for plain even spacing. */
+export function railTs(v: View, skewerId: string, mine: string[]): number[] | undefined {
+  const fr = v.layout.memberFracs?.[skewerId]
+  if (!fr) return undefined
+  return mine.map((m, i) => fr[m] ?? (i + 0.5) / mine.length)
+}
+
+/** The align contract, applied to one peer given the reference rail: the
+ * peer becomes the reference's segment offset only perpendicular — same
+ * direction, starts and ends colinear, each rail keeping its own sideways
+ * lane offset. */
+export function alignGeom(ref: SkewerGeom, peer: SkewerGeom): SkewerGeom {
+  const dx = ref.b.x - ref.a.x
+  const dy = ref.b.y - ref.a.y
+  const len = Math.hypot(dx, dy) || 1
+  const nx = -dy / len
+  const ny = dx / len
+  const midx = (peer.a.x + peer.b.x) / 2 - ref.a.x
+  const midy = (peer.a.y + peer.b.y) / 2 - ref.a.y
+  const c = midx * nx + midy * ny // the peer's perpendicular lane offset
+  return {
+    a: { x: ref.a.x + nx * c, y: ref.a.y + ny * c },
+    b: { x: ref.b.x + nx * c, y: ref.b.y + ny * c },
+    pinned: peer.pinned,
+  }
+}
+
+export const angleOf = (geom: SkewerGeom): number =>
+  Math.atan2(geom.b.y - geom.a.y, geom.b.x - geom.a.x)
+
+// Lane layout: perpendicular distance between bundle-neighbor rails.
+export const LANE_GAP = 120
+
+/** Re-space roughly-parallel rails onto an equidistant perpendicular grid,
+ * keeping their current order. A pinned rail anchors the grid (and never
+ * moves itself); otherwise the grid centers on the rails' mean offset.
+ * Returns new geoms for the rails that move. */
+export function snapLanes(
+  entries: { id: string; geom: SkewerGeom }[],
+  gap: number,
+): Record<string, SkewerGeom> {
+  if (entries.length < 2) return {}
+  const ref = entries.find((e) => e.geom.pinned) ?? entries[0]
+  const ang = angleOf(ref.geom)
+  const nx = -Math.sin(ang)
+  const ny = Math.cos(ang)
+  const offs = entries.map((e) => {
+    const midx = (e.geom.a.x + e.geom.b.x) / 2 - ref.geom.a.x
+    const midy = (e.geom.a.y + e.geom.b.y) / 2 - ref.geom.a.y
+    return { ...e, c: midx * nx + midy * ny }
+  })
+  offs.sort((p, q) => p.c - q.c)
+  const pinnedRank = offs.findIndex((x) => x.geom.pinned)
+  const base =
+    pinnedRank >= 0
+      ? offs[pinnedRank].c - pinnedRank * gap
+      : offs.reduce((s, x) => s + x.c, 0) / offs.length - ((offs.length - 1) / 2) * gap
+  const out: Record<string, SkewerGeom> = {}
+  offs.forEach((x, rank) => {
+    if (x.geom.pinned) return
+    const d = base + rank * gap - x.c
+    out[x.id] = {
+      a: { x: x.geom.a.x + nx * d, y: x.geom.a.y + ny * d },
+      b: { x: x.geom.b.x + nx * d, y: x.geom.b.y + ny * d },
+      pinned: x.geom.pinned,
+    }
+  })
+  return out
+}
+
+/** Round values strictly between min and max for axis tick marks: whole
+ * days/weeks/months/years for dates, 1-2-5 steps for numbers. */
+export function axisTicks(min: number, max: number, isDate: boolean): number[] {
+  const range = max - min
+  if (range <= 0) return []
+  let step: number
+  if (isDate) {
+    const DAY = 86_400_000
+    const steps = [DAY, 7 * DAY, 14 * DAY, 30 * DAY, 91 * DAY, 182 * DAY, 365 * DAY, 730 * DAY]
+    step = steps.find((s) => range / s <= 6) ?? Math.ceil(range / (6 * 365 * DAY)) * 365 * DAY
+  } else {
+    const raw = range / 5
+    const mag = 10 ** Math.floor(Math.log10(raw))
+    const norm = raw / mag
+    step = (norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10) * mag
+  }
+  const ticks: number[] = []
+  for (let t = Math.ceil(min / step) * step; t < max; t += step) {
+    // Leave the endpoint labels room to breathe.
+    if (t - min > range * 0.05 && max - t > range * 0.05) ticks.push(t)
+  }
+  return ticks
+}
+
+export function formatOrderValue(t: number, isDate: boolean): string {
+  if (isDate) return new Date(t).toISOString().slice(0, 10)
+  return Math.abs(t) >= 1000 || Number.isInteger(t) ? String(Math.round(t)) : t.toPrecision(3)
+}
+
+// -- color binding --------------------------------------------------------------
+
+/** Fallback palette for bound values without a pinned color (Tableau 10 — the
+ * same family the type colors tend to come from). */
+export const BIND_PALETTE = [
+  '#4e79a7',
+  '#f28e2c',
+  '#e15759',
+  '#76b7b2',
+  '#59a14f',
+  '#edc949',
+  '#af7aa1',
+  '#ff9da7',
+  '#9c755f',
+  '#bab0ab',
+]
+
+const strHash = (s: string): number => {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
+  return h
+}
+
+/** The bound color value of a node under the schema's colorKey, or null. */
+export function boundValue(
+  schema: GraphSchema,
+  node: { data: Record<string, unknown> },
+): string | null {
+  if (!schema.colorKey) return null
+  const raw = node.data?.[schema.colorKey]
+  if (raw === undefined || raw === null || raw === '') return null
+  return typeof raw === 'string' || typeof raw === 'number' ? String(raw) : null
+}
+
+/** A node's display color: the bound value's color when the schema binds one
+ * and the node carries the field, else the type color passed as fallback. */
+export function nodeColor(
+  schema: GraphSchema,
+  node: { data: Record<string, unknown> },
+  fallback: string,
+): string {
+  const value = boundValue(schema, node)
+  if (value === null) return fallback
+  return schema.colorValues?.[value] ?? BIND_PALETTE[strHash(value) % BIND_PALETTE.length]
 }
 
 /** Which nodes/edges the view shows: type checkboxes XOR per-item overrides,
@@ -295,13 +618,18 @@ export function peripheryDim(
   return dim
 }
 
-/** Even placement of the visible members along the a→b segment. Hidden
- * members simply drop out, so the survivors re-space — instant compaction. */
-export function placeAlong(geom: SkewerGeom, ids: string[]): Record<string, Position> {
+/** Placement of the visible members along the a→b segment: even by default
+ * (hidden members drop out, the survivors re-space — instant compaction), or
+ * at explicit fractions `ts` when the skewer's group is spaced by value. */
+export function placeAlong(
+  geom: SkewerGeom,
+  ids: string[],
+  ts?: number[],
+): Record<string, Position> {
   const out: Record<string, Position> = {}
   const n = ids.length
   ids.forEach((id, i) => {
-    const t = (i + 0.5) / n
+    const t = ts?.[i] ?? (i + 0.5) / n
     out[id] = {
       x: geom.a.x + (geom.b.x - geom.a.x) * t,
       y: geom.a.y + (geom.b.y - geom.a.y) * t,
@@ -320,6 +648,7 @@ const EDGE_CLEAR = NODE_R + 1 + MARGIN // node-center clearance from an edge seg
 export interface SkewerRig {
   geom: SkewerGeom
   visMembers: string[]
+  ts?: number[] // per-member rail fractions (value spacing); even when absent
 }
 
 const segPointDist = (a: Position, b: Position, p: Position): { d: number; cx: number; cy: number } => {
@@ -377,7 +706,7 @@ export function resolveCollisions(
   for (let iter = 0; iter < 60 && !settled; iter++) {
     const pos: Record<string, Position> = { ...freePos }
     for (const [sid, r] of Object.entries(rigs)) {
-      Object.assign(pos, placeAlong(geoms[sid], r.visMembers))
+      Object.assign(pos, placeAlong(geoms[sid], r.visMembers, r.ts))
     }
     const nodeDelta = new Map<string, Position>()
     const skewerDelta = new Map<string, Position>()
@@ -691,11 +1020,15 @@ export function compactEdges(
   for (const [sid, r] of Object.entries(rigs)) for (const m of r.visMembers) memberOf.set(m, sid)
   const rigsWith = (geoms: Record<string, SkewerGeom>): Record<string, SkewerRig> =>
     Object.fromEntries(
-      Object.entries(rigs).map(([sid, r]) => [sid, { geom: geoms[sid], visMembers: r.visMembers }]),
+      Object.entries(rigs).map(([sid, r]) => [
+        sid,
+        { geom: geoms[sid], visMembers: r.visMembers, ts: r.ts },
+      ]),
     )
   const derive = (f: Record<string, Position>, geoms: Record<string, SkewerGeom>) => {
     const pos: Record<string, Position> = { ...f }
-    for (const [sid, r] of Object.entries(rigs)) Object.assign(pos, placeAlong(geoms[sid], r.visMembers))
+    for (const [sid, r] of Object.entries(rigs))
+      Object.assign(pos, placeAlong(geoms[sid], r.visMembers, r.ts))
     return pos
   }
   const straight = edges.filter((e) => {
@@ -794,7 +1127,8 @@ export function scoreArrangement(
   edges: { from: string; to: string }[],
 ): { score: number; collisions: number; crossings: number } {
   const pos: Record<string, Position> = { ...free }
-  for (const [, r] of Object.entries(rigs)) Object.assign(pos, placeAlong(r.geom, r.visMembers))
+  for (const [, r] of Object.entries(rigs))
+    Object.assign(pos, placeAlong(r.geom, r.visMembers, r.ts))
   const memberOf = new Map<string, string>()
   for (const [sid, r] of Object.entries(rigs)) for (const m of r.visMembers) memberOf.set(m, sid)
   const ids = Object.keys(pos)

@@ -52,17 +52,6 @@
             pkgs.nodejs_22
             pkgs.pnpm_10
           ];
-
-          shellHook = ''
-            echo "kge development environment"
-            echo ""
-            echo "  uv run kge serve          # server + API + ui/dist at :8151"
-            echo "  uv run kge --help         # the agent CLI"
-            echo "  cd ui && pnpm install     # UI deps"
-            echo "  cd ui && pnpm dev         # UI dev server, /api proxied to :8151"
-            echo "  cd ui && pnpm build       # build ui/dist for kge serve"
-            echo ""
-          '';
         };
 
         checks = {
