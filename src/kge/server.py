@@ -1,9 +1,13 @@
-"""The kge server: sessionless HTTP over the file store, plus the built UI.
+"""The kge server: sessionless HTTP over the file stores, plus the built UI.
 
-Two endpoints carry the whole editing model:
+One server offers several graphs (a GraphRegistry names them); each graph
+keeps the two-endpoint editing model:
 
-    GET /api/graph   the full graph (read fresh from the files every call)
-    PUT /api/graph   replace the whole graph (clobber, never merge)
+    GET /api/graphs               the graph ids (with counts)
+    POST /api/graphs              seed a new empty graph under the graphs root
+    GET /api/graphs/{id}          that graph, whole (read fresh from the files)
+    PUT /api/graphs/{id}          replace that graph, whole (clobber, never merge)
+    GET|PUT /api/graph            the default graph (the pre-multigraph API)
 
 Every mutating call is one whole-state write, so there is nothing to session:
 the browser's memory and the CLI's working.json are the only edit buffers.
@@ -18,17 +22,48 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from kge.models import Graph, SelectionState
-from kge.store import GraphStore
+from kge.store import GraphRegistry, GraphStore
 
 _STARTED_AT = time.time()
 
 
-def create_app(store: GraphStore, ui_dir: Path | None = None) -> FastAPI:
+class NewGraph(BaseModel):
+    id: str
+
+
+def create_app(registry: GraphRegistry, ui_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="kge server")
-    audit_dir = store.dir / ".audit"
+    audit_dir = registry.audit_dir()
     selection = SelectionState()  # transient, in-memory only (see models.SelectionState)
+
+    def store_or_404(graph_id: str) -> GraphStore:
+        store = registry.get(graph_id)
+        if store is None:
+            known = ", ".join(registry.stores()) or "(none)"
+            raise HTTPException(404, f"no such graph: {graph_id} (available: {known})")
+        return store
+
+    def default_store() -> GraphStore:
+        gid = registry.default_id()
+        if gid is None:
+            raise HTTPException(500, "this server has no graphs")
+        return store_or_404(gid)
+
+    def load(store: GraphStore) -> dict:
+        try:
+            return store.load().model_dump(by_alias=True)
+        except Exception as exc:
+            raise HTTPException(500, f"graph files are unreadable: {exc}")
+
+    def save(store: GraphStore, graph: Graph) -> dict:
+        try:
+            summary = store.save(graph)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"saved": True, **summary}
 
     @app.middleware("http")
     async def audit(request: Request, call_next):
@@ -54,22 +89,73 @@ def create_app(store: GraphStore, ui_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/version")
     async def version():
+        stores = registry.stores()
         rev = ""
-        r = subprocess.run(
-            ["git", "-C", str(store.dir), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode == 0:
-            rev = r.stdout.strip()
-        return {"rev": rev, "started_at": _STARTED_AT, "graph_dir": str(store.dir)}
+        first = next(iter(stores.values()), None)
+        if first is not None:
+            r = subprocess.run(
+                ["git", "-C", str(first.dir), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode == 0:
+                rev = r.stdout.strip()
+        return {
+            "rev": rev,
+            "started_at": _STARTED_AT,
+            "default_graph": registry.default_id(),
+            "graph_dirs": {gid: str(s.dir) for gid, s in stores.items()},
+        }
 
+    @app.get("/api/graphs")
+    async def list_graphs():
+        out = []
+        for gid, store in registry.stores().items():
+            g = Graph.model_validate(load(store))
+            out.append(
+                {
+                    "id": gid,
+                    "nodes": len(g.nodes),
+                    "edges": len(g.edges),
+                    "views": len(g.views),
+                    "default": gid == registry.default_id(),
+                }
+            )
+        return {"graphs": out}
+
+    @app.post("/api/graphs")
+    async def create_graph(body: NewGraph):
+        try:
+            registry.create(body.id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"created": body.id}
+
+    @app.delete("/api/graphs/{graph_id}")
+    async def delete_graph(graph_id: str):
+        try:
+            registry.delete(graph_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"deleted": graph_id}
+
+    @app.get("/api/graphs/{graph_id}")
+    async def get_one(graph_id: str):
+        return load(store_or_404(graph_id))
+
+    @app.put("/api/graphs/{graph_id}")
+    async def put_one(graph_id: str, graph: Graph):
+        return save(store_or_404(graph_id), graph)
+
+    # The pre-multigraph API: unqualified means the default graph. Kept so
+    # data repos pinning an older CLI against a newer server still work.
     @app.get("/api/graph")
     async def get_graph():
-        try:
-            return store.load().model_dump(by_alias=True)
-        except Exception as exc:
-            raise HTTPException(500, f"graph files are unreadable: {exc}")
+        return load(default_store())
+
+    @app.put("/api/graph")
+    async def put_graph(graph: Graph):
+        return save(default_store(), graph)
 
     @app.get("/api/selection")
     async def get_selection():
@@ -80,14 +166,6 @@ def create_app(store: GraphStore, ui_dir: Path | None = None) -> FastAPI:
         nonlocal selection
         selection = state
         return {"ok": True}
-
-    @app.put("/api/graph")
-    async def put_graph(graph: Graph):
-        try:
-            summary = store.save(graph)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
-        return {"saved": True, **summary}
 
     if ui_dir and ui_dir.is_dir():
         app.mount("/", StaticFiles(directory=ui_dir, html=True), name="ui")

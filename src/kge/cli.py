@@ -34,7 +34,17 @@ app = typer.Typer(
 )
 
 DEFAULT_SERVER = os.environ.get("KGE_SERVER_URL", "http://localhost:8151")
+DEFAULT_GRAPH = os.environ.get("KGE_GRAPH", "")
 ServerOpt = Annotated[str, typer.Option("--server", "-s", help="kge server URL")]
+GraphOpt = Annotated[
+    str,
+    typer.Option(
+        "--graph",
+        "-g",
+        help="Which graph, when the server offers several (kge graphs lists them; "
+        "$KGE_GRAPH sets the default; unset = the server's default graph)",
+    ),
+]
 DataOpt = Annotated[str, typer.Option("--data", help="Extra properties as a JSON object")]
 
 
@@ -43,18 +53,27 @@ def _fail(msg: str) -> typer.Exit:
     return typer.Exit(1)
 
 
-def _fetch(server: str) -> Graph:
+def _graph_url(server: str, graph: str) -> str:
+    return f"{server}/api/graphs/{graph}" if graph else f"{server}/api/graph"
+
+
+def _fetch(server: str, graph: str = "") -> Graph:
     try:
-        resp = httpx.get(f"{server}/api/graph", timeout=30.0)
+        resp = httpx.get(_graph_url(server, graph), timeout=30.0)
         resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.json().get("detail", exc.response.text)
+        raise _fail(f"server refused: {detail}")
     except httpx.HTTPError as exc:
         raise _fail(f"can't reach the kge server at {server}: {exc}")
     return Graph.model_validate(resp.json())
 
 
-def _push(server: str, graph: Graph) -> dict:
+def _push(server: str, graph_id: str, graph: Graph) -> dict:
     resp = httpx.put(
-        f"{server}/api/graph", json=graph.model_dump(by_alias=True, mode="json"), timeout=60.0
+        _graph_url(server, graph_id),
+        json=graph.model_dump(by_alias=True, mode="json"),
+        timeout=60.0,
     )
     if resp.status_code >= 400:
         ct = resp.headers.get("content-type", "")
@@ -92,33 +111,59 @@ def _packaged_ui() -> Path | None:
 @app.command()
 def serve(
     graph_dir: Annotated[
-        Path, typer.Option("--graph-dir", help="Directory holding the graph JSON files")
-    ] = Path("graph"),
+        list[Path] | None,
+        typer.Option(
+            "--graph-dir",
+            help="A graph directory to serve (repeatable; the graph's id is the "
+            "dir's basename; the first one is the default graph)",
+        ),
+    ] = None,
+    graphs_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--graphs-dir",
+            help="A root whose subdirectories are graphs (rescanned per request, "
+            "so new graph dirs appear without a restart)",
+        ),
+    ] = None,
     ui_dir: Annotated[
         Path | None,
         typer.Option("--ui-dir", help="Built UI to serve at / (default: ./ui/dist, else the UI vendored in the package)"),
     ] = None,
     port: Annotated[int, typer.Option("--port", help="Server port")] = 8151,
 ) -> None:
-    """Run the kge server over a graph directory.
+    """Run the kge server over one or more graph directories.
 
-    Creates an empty-but-valid graph directory if one doesn't exist, so a
-    fresh consumer repo can start with just `kge serve`.
+    With no options: serves the subdirectories of ./graphs if that exists,
+    else ./graph (seeding an empty-but-valid graph there if missing, so a
+    fresh consumer repo can start with just `kge serve`).
     """
     import uvicorn
 
     from kge.server import create_app
-    from kge.store import GraphStore
+    from kge.store import GraphRegistry, GraphStore
 
-    store = GraphStore(graph_dir.resolve())
-    store.ensure()
+    if graph_dir is None and graphs_dir is None:
+        if Path("graphs").is_dir():
+            graphs_dir = Path("graphs")
+        else:
+            graph_dir = [Path("graph")]
+    registry = GraphRegistry(dirs=graph_dir, root=graphs_dir)
+    for d in registry.dirs:
+        GraphStore(d).ensure()
+    if not registry.stores():
+        # An empty graphs root seeds one graph, like an absent ./graph does.
+        GraphStore(registry.root / "default").ensure()
+    stores = registry.stores()
     if ui_dir is None:
         local = Path("ui") / "dist"
         ui_dir = local if (local / "index.html").is_file() else _packaged_ui()
-    console.print(f"graph dir: {store.dir}")
+    for gid, store in stores.items():
+        mark = "  (default)" if gid == registry.default_id() else ""
+        console.print(f"graph {gid}: {store.dir}{mark}")
     console.print(f"ui: {ui_dir.resolve() if ui_dir else '(none found — API only)'}")
     console.print(f"open http://localhost:{port}")
-    uvicorn.run(create_app(store, ui_dir), host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(create_app(registry, ui_dir), host="0.0.0.0", port=port, log_level="warning")
 
 
 @app.command()
@@ -131,20 +176,27 @@ def onboarding() -> None:
     console.print("""\
 [bold]kge — the knowledge graph editor[/bold]
 
-One graph, two kinds of editors: humans use a browser UI, agents use this
-CLI. Both talk to the same small server. The source of truth is JSON files
-checked into git — the database is just what's in those files.
+Knowledge graphs, two kinds of editors: humans use a browser UI, agents use
+this CLI. Both talk to the same small server. The source of truth is JSON
+files checked into git — the database is just what's in those files.
 
-[bold]Where state lives[/bold]
+One server can offer SEVERAL graphs (`kge graphs` lists them; the browser
+has a matching picker). Every other command takes --graph/-g (or $KGE_GRAPH)
+to say which one; unset means the server's default graph. `kge selection`
+reports which graph the human is looking at — check it before editing so
+you're both on the same one. `kge add-graph <id>` seeds a new empty graph.
 
-  graph/schema.json        node/edge type vocabulary (colors, families)
-  graph/nodes.json         the nodes            } the knowledge —
-  graph/edges.json         the edges            } committed to git
-  graph/views/<id>.json    named views: type filters, per-item overrides,
+[bold]Where state lives[/bold] (one directory per graph — graphs/<id>/ when the
+repo serves several, graph/ when it serves one)
+
+  <dir>/schema.json        node/edge type vocabulary (colors, families)
+  <dir>/nodes.json         the nodes            } the knowledge —
+  <dir>/edges.json         the edges            } committed to git
+  <dir>/views/<id>.json    named views: type filters, per-item overrides,
                            focus + eye adjustments, layout (positions and
-                           skewer segments)
-  server memory only       the human's current selection + view (transient,
-                           last-writer-wins; read it with `kge selection`)
+                           skewer segments) — views belong to their graph
+  server memory only       the human's current selection + graph + view
+                           (transient, last-writer-wins; `kge selection`)
   browser memory only      the human's UNSAVED edit buffer
   this CLI                 nothing — every command is stateless
 
@@ -182,11 +234,13 @@ checked into git — the database is just what's in those files.
     Where a skewer sits on screen is per-view, not graph data.
     Declaring `--order-key <field>` (the member-data field the order
     reflects, e.g. a date) bundles skewers so the UI can align their rails
-    (shared direction, colinear ends), snap them into equidistant lanes,
-    and space members on one shared scale — by merged rank or by value with
-    a labeled axis; `--group <name>` splits bundles that share a key.
+    (shared direction, colinear ends), drag them around as one rigid group,
+    snap them into equidistant lanes, and space members on one shared
+    scale — by merged rank or by value with a labeled axis; `--group
+    <name>` splits bundles that share a key.
   - [bold]Views[/bold] are saved perspectives: which types/items are included, an
-    optional k-hop focus with manual show/hide adjustments, and all layout
+    optional k-hop foci (several may coexist; their neighborhoods union)
+    with manual show/hide adjustments, and all layout
     geometry. `kge views` lists them; `kge views <id>` resolves one to
     exactly what it displays.
 
@@ -201,8 +255,10 @@ checked into git — the database is just what's in those files.
 
 [bold]Reading and editing[/bold]
 
-  read:  status · ls · show · types · views · selection · find-collisions · dump
-  edit:  add-node · rm-node · add-edge · rm-edge · add-type · skewer · load
+  read:  status · graphs · ls · show · types · views · selection ·
+         find-collisions · dump
+  edit:  add-graph · add-node · rm-node · add-edge · rm-edge · add-type ·
+         skewer · load
 
   `kge dump > g.json`, edit, `kge load g.json` for bulk changes (whole-state
   replace). After any edit: remind the human to Refresh. The files under
@@ -214,27 +270,72 @@ checked into git — the database is just what's in those files.
 
 
 @app.command()
-def status(server: ServerOpt = DEFAULT_SERVER) -> None:
+def status(graph: GraphOpt = DEFAULT_GRAPH, server: ServerOpt = DEFAULT_SERVER) -> None:
     """Graph counts and server identity."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     ver = httpx.get(f"{server}/api/version", timeout=10.0).json()
-    console.print(f"server: {server}  graph_dir: {ver.get('graph_dir')}  rev: {ver.get('rev', '')[:12]}")
+    gid = graph or ver.get("default_graph", "")
+    gdir = ver.get("graph_dirs", {}).get(gid, "")
+    console.print(f"server: {server}  graph: {gid}  dir: {gdir}  rev: {ver.get('rev', '')[:12]}")
     console.print(
         f"nodes: {len(g.nodes)}  edges: {len(g.edges)}  views: {len(g.views)}  "
         f"node types: {len(g.graph_schema.nodeTypes)}  edge types: {len(g.graph_schema.edgeTypes)}"
     )
+    others = [k for k in ver.get("graph_dirs", {}) if k != gid]
+    if others:
+        console.print(f"[dim]other graphs on this server: {', '.join(others)} (use --graph)[/dim]")
+
+
+@app.command()
+def graphs(server: ServerOpt = DEFAULT_SERVER) -> None:
+    """List the graphs this server offers."""
+    try:
+        resp = httpx.get(f"{server}/api/graphs", timeout=30.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise _fail(f"can't reach the kge server at {server}: {exc}")
+    for g in resp.json().get("graphs", []):
+        mark = "  [dim](default)[/dim]" if g.get("default") else ""
+        console.print(
+            f"{g['id']}  [dim]{g['nodes']} nodes / {g['edges']} edges / {g['views']} view(s)[/dim]{mark}"
+        )
+
+
+@app.command("add-graph")
+def add_graph(
+    graph_id: Annotated[str, typer.Argument(help="Id for the new graph (becomes its directory name)")],
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """Seed a new empty graph on the server (needs a graphs root: serve --graphs-dir)."""
+    resp = httpx.post(f"{server}/api/graphs", json={"id": graph_id}, timeout=30.0)
+    if resp.status_code >= 400:
+        raise _fail(f"server refused: {resp.json().get('detail', resp.text)}")
+    console.print(f"created graph {graph_id}")
+
+
+@app.command("rm-graph")
+def rm_graph(
+    graph_id: Annotated[str, typer.Argument(help="Graph to delete (its directory is removed)")],
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """Delete a graph and its files from the server. Git history is the undo."""
+    resp = httpx.delete(f"{server}/api/graphs/{graph_id}", timeout=30.0)
+    if resp.status_code >= 400:
+        raise _fail(f"server refused: {resp.json().get('detail', resp.text)}")
+    console.print(f"deleted graph {graph_id}")
 
 
 @app.command()
 def ls(
     type: Annotated[str | None, typer.Option("--type", "-t", help="Filter by node type")] = None,
-    grep: Annotated[str | None, typer.Option("--grep", "-g", help="Regex over id/label")] = None,
+    grep: Annotated[str | None, typer.Option("--grep", help="Regex over id/label")] = None,
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """List nodes."""
     import re
 
-    g = _fetch(server)
+    g = _fetch(server, graph)
     pattern = re.compile(grep, re.IGNORECASE) if grep else None
     for n in sorted(g.nodes, key=lambda n: n.id):
         if type and n.type != type:
@@ -246,9 +347,13 @@ def ls(
 
 
 @app.command()
-def show(node_id: Annotated[str, typer.Argument(help="Node id")], server: ServerOpt = DEFAULT_SERVER) -> None:
+def show(
+    node_id: Annotated[str, typer.Argument(help="Node id")],
+    graph: GraphOpt = DEFAULT_GRAPH,
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
     """One node with its edges."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     node = next((n for n in g.nodes if n.id == node_id), None)
     if node is None:
         raise _fail(f"no such node: {node_id}")
@@ -271,7 +376,9 @@ def selection(server: ServerOpt = DEFAULT_SERVER) -> None:
         sel = httpx.get(f"{server}/api/selection", timeout=10.0).json()
     except httpx.HTTPError as exc:
         raise _fail(f"can't reach the kge server at {server}: {exc}")
-    g = _fetch(server)
+    g = _fetch(server, sel.get("graph") or "")
+    if sel.get("graph"):
+        console.print(f"[dim]graph: {sel['graph']}[/dim]")
 
     def show_slot(slot: str) -> None:
         s = sel.get(slot)
@@ -309,9 +416,10 @@ def selection(server: ServerOpt = DEFAULT_SERVER) -> None:
 @app.command()
 def views(
     view_id: Annotated[str | None, typer.Argument(help="View id (omit to list all views)")] = None,
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
-    """List the saved views, or resolve one to exactly what it shows.
+    """List the saved views of a graph, or resolve one to exactly what it shows.
 
     With an ID: the view's type filters, include overrides, focus and eye
     adjustments, pinned nodes, skewer segments, and the resolved lists of
@@ -319,11 +427,15 @@ def views(
     """
     from kge import geometry
 
-    g = _fetch(server)
+    g = _fetch(server, graph)
     if view_id is None:
         for v in g.views:
             nodes, edges = geometry.visible_sets(g, v)
-            focus = f"  focus: {v.focus.node} ({v.focus.kHops} hops)" if v.focus else ""
+            focus = (
+                "  foci: " + ", ".join(f"{f.node} ({f.kHops} hops)" for f in v.foci)
+                if v.foci
+                else ""
+            )
             console.print(
                 f"{v.id}  [dim]{v.name}[/dim]  showing {len(nodes)} nodes / {len(edges)} edges{focus}"
             )
@@ -349,8 +461,8 @@ def views(
     ):
         if items:
             console.print(f"  {label}: {', '.join(items)}")
-    if v.focus:
-        console.print(f"  focus: {v.focus.node} ({v.focus.kHops} hops)")
+    for f in v.foci:
+        console.print(f"  focus: {f.node} ({f.kHops} hops)")
     if v.layout.pinned:
         console.print(f"  pinned nodes: {', '.join(v.layout.pinned)}")
     for sid, geom in v.layout.skewers.items():
@@ -380,6 +492,7 @@ def find_collisions(
         str | None,
         typer.Option("--view", help="View whose geometry to use (default: the browser's current view)"),
     ] = None,
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Spatial overlaps of the target with objects it isn't connected to.
@@ -394,7 +507,7 @@ def find_collisions(
         sel = httpx.get(f"{server}/api/selection", timeout=10.0).json()
     except httpx.HTTPError as exc:
         raise _fail(f"can't reach the kge server at {server}: {exc}")
-    g = _fetch(server)
+    g = _fetch(server, graph or sel.get("graph") or "")
 
     if of:
         obj_id = of
@@ -433,9 +546,9 @@ def find_collisions(
 
 
 @app.command()
-def types(server: ServerOpt = DEFAULT_SERVER) -> None:
+def types(graph: GraphOpt = DEFAULT_GRAPH, server: ServerOpt = DEFAULT_SERVER) -> None:
     """The schema: node and edge types."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     counts: dict[str, int] = {}
     for n in g.nodes:
         counts[n.type] = counts.get(n.type, 0) + 1
@@ -459,10 +572,11 @@ def add_node(
     node_id: Annotated[str, typer.Argument(help="Node id")],
     label: Annotated[str, typer.Option("--label", "-l")] = "",
     data: DataOpt = "{}",
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Add (or update, if the id exists) a node."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     props = _parse_data(data)
     existing = next((n for n in g.nodes if n.id == node_id), None)
     if existing:
@@ -474,23 +588,24 @@ def add_node(
     else:
         g.nodes.append(Node(id=node_id, type=type, label=label, data=props))
         verb = "added"
-    _push(server, g)
+    _push(server, graph, g)
     console.print(f"{verb} {node_id} [dim]({type})[/dim]")
 
 
 @app.command("rm-node")
 def rm_node(
     node_id: Annotated[str, typer.Argument(help="Node id")],
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Remove a node and its incident edges (layout refs are pruned server-side)."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     if not any(n.id == node_id for n in g.nodes):
         raise _fail(f"no such node: {node_id}")
     g.nodes = [n for n in g.nodes if n.id != node_id]
     dropped = [e for e in g.edges if node_id in (e.src, e.dst)]
     g.edges = [e for e in g.edges if node_id not in (e.src, e.dst)]
-    _push(server, g)
+    _push(server, graph, g)
     console.print(f"removed {node_id} and {len(dropped)} incident edge(s)")
 
 
@@ -501,10 +616,11 @@ def add_edge(
     dst: Annotated[str, typer.Argument(help="Target node id")],
     note: Annotated[str, typer.Option("--note", help="Evidence note, e.g. file:line")] = "",
     data: DataOpt = "{}",
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Add an edge. Both endpoints must already exist."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     props = _parse_data(data)
     if note:
         props["note"] = note
@@ -515,7 +631,7 @@ def add_edge(
     else:
         g.edges.append(Edge.model_validate({"type": type, "from": src, "to": dst, "data": props}))
         verb = "added"
-    _push(server, g)
+    _push(server, graph, g)
     console.print(f"{verb} {src} -[{type}]-> {dst}")
 
 
@@ -524,15 +640,16 @@ def rm_edge(
     type: Annotated[str, typer.Argument()],
     src: Annotated[str, typer.Argument()],
     dst: Annotated[str, typer.Argument()],
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Remove one edge."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     before = len(g.edges)
     g.edges = [e for e in g.edges if e.key != (type, src, dst)]
     if len(g.edges) == before:
         raise _fail(f"no such edge: {type} {src} -> {dst}")
-    _push(server, g)
+    _push(server, graph, g)
     console.print(f"removed {src} -[{type}]-> {dst}")
 
 
@@ -542,15 +659,16 @@ def add_type(
     name: Annotated[str, typer.Argument(help="Type name")],
     color: Annotated[str, typer.Option("--color", help="Hex color for the UI")] = "",
     description: Annotated[str, typer.Option("--description", "-d")] = "",
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Add a node or edge type to the schema."""
     if kind not in ("node", "edge"):
         raise _fail("kind must be 'node' or 'edge'")
-    g = _fetch(server)
+    g = _fetch(server, graph)
     block = g.graph_schema.nodeTypes if kind == "node" else g.graph_schema.edgeTypes
     block[name] = TypeDef(color=color, description=description)
-    _push(server, g)
+    _push(server, graph, g)
     console.print(f"added {kind} type {name}")
 
 
@@ -576,17 +694,19 @@ def skewer(
             "unrelated bundles happen to share an ordering key",
         ),
     ] = "",
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Create or replace a skewer: an ordered colinearity group stored in the graph.
 
     Membership and order are knowledge (a `skewer` node plus `skewer-order`
     edges with data.index); where the skewer sits on screen is per-view and is
-    arranged in the browser. Replaces any existing membership of SKEWER_ID.
+    arranged in the browser. Replaces any existing membership of SKEWER_ID,
+    and MOVES the given members off any other skewer (one skewer per node).
     """
     if len(members) < 2:
         raise _fail("a skewer needs at least 2 members")
-    g = _fetch(server)
+    g = _fetch(server, graph)
     node_ids = {n.id for n in g.nodes}
     missing = [m for m in members if m not in node_ids]
     if missing:
@@ -608,33 +728,41 @@ def skewer(
     if group:
         node.data["group"] = group
     g.edges = [e for e in g.edges if not (e.type == "skewer-order" and e.src == skewer_id)]
+    member_set = set(members)
+    moved = sorted(
+        {f"{e.dst} (from {e.src})" for e in g.edges if e.type == "skewer-order" and e.dst in member_set}
+    )
+    g.edges = [e for e in g.edges if not (e.type == "skewer-order" and e.dst in member_set)]
     for i, m in enumerate(members):
         g.edges.append(
             Edge.model_validate({"type": "skewer-order", "from": skewer_id, "to": m, "data": {"index": i}})
         )
-    _push(server, g)
+    _push(server, graph, g)
     console.print(f"skewer {skewer_id}: {' → '.join(members)}")
+    if moved:
+        console.print(f"[dim]moved off other skewers: {', '.join(moved)}[/dim]")
 
 
 # -- bulk ---------------------------------------------------------------------
 
 
 @app.command()
-def dump(server: ServerOpt = DEFAULT_SERVER) -> None:
+def dump(graph: GraphOpt = DEFAULT_GRAPH, server: ServerOpt = DEFAULT_SERVER) -> None:
     """Print the whole graph as JSON (edit it, then `kge load`)."""
-    g = _fetch(server)
+    g = _fetch(server, graph)
     print(json.dumps(g.model_dump(by_alias=True), indent=2))
 
 
 @app.command()
 def load(
     path: Annotated[Path, typer.Argument(help="JSON file with the whole graph payload, or - for stdin")],
+    graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Replace the whole graph from a file (clobber, never merge)."""
     raw = sys.stdin.read() if str(path) == "-" else path.read_text()
     g = Graph.model_validate(json.loads(raw))
-    summary = _push(server, g)
+    summary = _push(server, graph, g)
     console.print(f"saved: {summary}")
 
 

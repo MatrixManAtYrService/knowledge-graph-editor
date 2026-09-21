@@ -8,6 +8,7 @@
 
 import type {
   AxisInfo,
+  Focus,
   GraphPayload,
   GraphSchema,
   Position,
@@ -364,14 +365,20 @@ export function nodeColor(
   return schema.colorValues?.[value] ?? BIND_PALETTE[strHash(value) % BIND_PALETTE.length]
 }
 
+/** The view's focus centers (defensive: payloads always arrive with `foci`
+ * from the server, which migrates the old single-focus form). */
+export function fociOf(v: View): Focus[] {
+  return v.foci ?? []
+}
+
 /** Which nodes/edges the view shows: type checkboxes XOR per-item overrides,
- * then optional k-hop focus. Skewer nodes and skewer-order edges are never
- * part of the normal sets — they're interpreted, not drawn, and don't
- * conduct reachability. */
+ * then the optional k-hop foci (their neighborhoods union). Skewer nodes and
+ * skewer-order edges are never part of the normal sets — they're
+ * interpreted, not drawn, and don't conduct reachability. */
 export function visibleSets(
   g: GraphPayload,
   v: View,
-): { nodes: Set<string>; edges: Set<string>; hops: Map<string, number> | null } {
+): { nodes: Set<string>; edges: Set<string> } {
   const nOv = new Set(v.nodeOverrides ?? [])
   const eOv = new Set(v.edgeOverrides ?? [])
   const nodeTypeChecked = (t: string) =>
@@ -388,29 +395,18 @@ export function visibleSets(
   const edgeVisible = (e: { type: string; from: string; to: string }) =>
     edgeTypeOk(e) && nodes.has(e.from) && nodes.has(e.to)
 
-  let hops: Map<string, number> | null = null
-  if (v.focus && nodes.has(v.focus.node)) {
+  const foci = fociOf(v).filter((f) => nodes.has(f.node))
+  if (foci.length) {
     const adj = new Map<string, string[]>()
     for (const e of g.edges) {
       if (!edgeVisible(e)) continue
       adj.set(e.from, [...(adj.get(e.from) ?? []), e.to])
       adj.set(e.to, [...(adj.get(e.to) ?? []), e.from])
     }
-    const dist = new Map<string, number>([[v.focus.node, 0]])
-    const queue = [v.focus.node]
-    while (queue.length) {
-      const cur = queue.shift()!
-      const d = dist.get(cur)!
-      if (d >= v.focus.kHops) continue
-      for (const next of adj.get(cur) ?? []) {
-        if (!dist.has(next)) {
-          dist.set(next, d + 1)
-          queue.push(next)
-        }
-      }
-    }
-    nodes = new Set([...nodes].filter((n) => dist.has(n)))
-    hops = dist
+    // Union of the foci's k-hop neighborhoods (each its own radius).
+    const reach = new Set<string>()
+    for (const f of foci) for (const n of hopBFS(adj, f.node, f.kHops).keys()) reach.add(n)
+    nodes = new Set([...nodes].filter((n) => reach.has(n)))
   }
 
   // Eye adjustments on top of the focus: summon included items back, banish
@@ -426,7 +422,57 @@ export function visibleSets(
   const edges = new Set(
     g.edges.filter((e) => edgeVisible(e) && !hide.has(edgeKey(e))).map((e) => edgeKey(e)),
   )
-  return { nodes, edges, hops }
+  return { nodes, edges }
+}
+
+/** Distances from `center` out to `k` hops over an adjacency map. */
+function hopBFS(adj: Map<string, string[]>, center: string, k: number): Map<string, number> {
+  const dist = new Map<string, number>([[center, 0]])
+  const queue = [center]
+  while (queue.length) {
+    const cur = queue.shift()!
+    const d = dist.get(cur)!
+    if (d >= k) continue
+    for (const next of adj.get(cur) ?? []) {
+      if (!dist.has(next)) {
+        dist.set(next, d + 1)
+        queue.push(next)
+      }
+    }
+  }
+  return dist
+}
+
+/** One focus's reach — the nodes within k hops of `center` over the view's
+ * INCLUDED graph (ignoring other foci and eye adjustments), plus the shown
+ * edges joining them. What "remove focus" sweeps eye-summons out of. */
+export function focusReach(
+  g: GraphPayload,
+  v: View,
+  center: string,
+  k: number,
+): { nodes: Set<string>; edges: Set<string> } {
+  const included = includedNodeIds(g, v)
+  const eOv = new Set(v.edgeOverrides ?? [])
+  const edgeTypeChecked = (t: string) =>
+    v.visibleEdgeTypes === null || v.visibleEdgeTypes.includes(t)
+  const edgeOk = (e: { type: string; from: string; to: string }) =>
+    e.type !== SKEWER_EDGE &&
+    edgeTypeChecked(e.type) !== eOv.has(edgeKey(e)) &&
+    included.has(e.from) &&
+    included.has(e.to)
+  const adj = new Map<string, string[]>()
+  for (const e of g.edges) {
+    if (!edgeOk(e)) continue
+    adj.set(e.from, [...(adj.get(e.from) ?? []), e.to])
+    adj.set(e.to, [...(adj.get(e.to) ?? []), e.from])
+  }
+  const dist = hopBFS(adj, center, k)
+  const nodes = new Set(dist.keys())
+  const edges = new Set(
+    g.edges.filter((e) => edgeOk(e) && nodes.has(e.from) && nodes.has(e.to)).map(edgeKey),
+  )
+  return { nodes, edges }
 }
 
 /** The nodes the view *includes* (type checkboxes XOR overrides), before any
@@ -442,15 +488,16 @@ export function includedNodeIds(g: GraphPayload, v: View): Set<string> {
 export type DimLevel = 'near' | 'outer'
 
 /**
- * Which shown nodes are the *periphery* of the focus, and how dimmed.
+ * Which shown nodes are the *periphery* of the foci, and how dimmed.
  *
- * Distances are computed over the SHOWN subgraph. Base bands per the global
- * radius k: d == k dims heavily, d == k-1 lightly (when k >= 3). On top:
- *   - nodes beyond the radius (only reachable via eye-summons, or left
+ * Distances are computed over the SHOWN subgraph. Per-node *slack* is the
+ * best margin any focus gives it (kᵢ - distᵢ): slack 0 dims heavily,
+ * slack 1 lightly (when that focus's k >= 3). On top:
+ *   - nodes beyond every radius (only reachable via eye-summons, or left
  *     dangling by banishes) are the new periphery and dim heavily — but any
- *     node on a simple path from the center to such a node is exempt: the
+ *     node on a simple path from a center to such a node is exempt: the
  *     frontier moves outward along summoned paths.
- *   - nodes on a cycle through the center (same biconnected block, of size
+ *   - nodes on a cycle through a center (same biconnected block, of size
  *     >= 3) are never dimmed: a loop has no dead end.
  */
 export function peripheryDim(
@@ -460,9 +507,9 @@ export function peripheryDim(
   shownEdges: Set<string>,
 ): Map<string, DimLevel> {
   const dim = new Map<string, DimLevel>()
-  const center = v.focus?.node
-  const k = v.focus?.kHops ?? 0
-  if (!center || !shownNodes.has(center)) return dim
+  const foci = fociOf(v).filter((f) => shownNodes.has(f.node))
+  if (!foci.length) return dim
+  const centers = new Set(foci.map((f) => f.node))
 
   // Deduped adjacency over the shown subgraph.
   const adjSet = new Map<string, Set<string>>()
@@ -474,15 +521,29 @@ export function peripheryDim(
   }
   const adj = new Map([...adjSet.entries()].map(([id, s]) => [id, [...s]]))
 
-  // Distances from the center within the shown subgraph.
-  const d = new Map<string, number>([[center, 0]])
-  const queue = [center]
-  while (queue.length) {
-    const cur = queue.shift()!
-    for (const nb of adj.get(cur) ?? []) {
-      if (!d.has(nb)) {
-        d.set(nb, d.get(cur)! + 1)
-        queue.push(nb)
+  // Per-node slack: the best margin any focus grants (kᵢ - distᵢ within the
+  // shown subgraph, unbounded BFS), and the k of a focus attaining it (for
+  // the near-band rule). Nodes no focus reaches keep slack -Infinity.
+  const slack = new Map<string, number>()
+  const slackK = new Map<string, number>()
+  for (const f of foci) {
+    const d = new Map<string, number>([[f.node, 0]])
+    const queue = [f.node]
+    while (queue.length) {
+      const cur = queue.shift()!
+      for (const nb of adj.get(cur) ?? []) {
+        if (!d.has(nb)) {
+          d.set(nb, d.get(cur)! + 1)
+          queue.push(nb)
+        }
+      }
+    }
+    for (const [n, dist] of d) {
+      const s = f.kHops - dist
+      const best = slack.get(n)
+      if (best === undefined || s > best || (s === best && f.kHops > (slackK.get(n) ?? 0))) {
+        slack.set(n, s)
+        slackK.set(n, f.kHops)
       }
     }
   }
@@ -552,18 +613,19 @@ export function peripheryDim(
     }
   }
 
-  // On a real cycle (block of >= 3 vertices) through the center => never dim.
-  const centerBlocks = vblocks.get(center) ?? new Set<number>()
+  // On a real cycle (block of >= 3 vertices) through some center => never dim.
+  const centerBlocks = new Set<number>()
+  for (const c of centers) for (const b of vblocks.get(c) ?? []) centerBlocks.add(b)
   const onCycleWithCenter = (n: string): boolean =>
     [...(vblocks.get(n) ?? [])].some((b) => centerBlocks.has(b) && (blockSize.get(b) ?? 0) >= 3)
 
   // Block-cut structure as a bipartite tree (vertices <-> blocks): BFS from
-  // the center; vertices on some simple center->m path are exactly the union
-  // of the blocks along the tree path to m.
+  // all the centers at once; vertices on some simple center->m path are
+  // exactly the union of the blocks along the tree path to m.
   const parentOf = new Map<string, string>() // bipartite keys 'v:x' / 'b:n'
   {
-    const bfs = [`v:${center}`]
-    parentOf.set(`v:${center}`, '')
+    const bfs = [...centers].map((c) => `v:${c}`)
+    for (const key of bfs) parentOf.set(key, '')
     while (bfs.length) {
       const cur = bfs.shift()!
       const next: string[] = []
@@ -595,25 +657,27 @@ export function peripheryDim(
     return out
   }
 
-  // Beyond-the-radius shown nodes: the manual periphery.
-  const beyond = [...shownNodes].filter((n) => n !== center && (d.get(n) ?? Infinity) > k)
+  // Beyond-every-radius shown nodes: the manual periphery.
+  const beyond = [...shownNodes].filter(
+    (n) => !centers.has(n) && (slack.get(n) ?? -Infinity) < 0,
+  )
   const exempt = new Set<string>()
   for (const m of beyond) {
-    if (!d.has(m)) continue // disconnected: nothing to exempt
+    if (!slack.has(m)) continue // disconnected: nothing to exempt
     for (const w of simplePathVertices(m)) if (w !== m) exempt.add(w)
     if (onCycleWithCenter(m)) exempt.add(m)
   }
 
   for (const n of shownNodes) {
-    if (n === center || exempt.has(n)) continue
-    const dn = d.get(n) ?? Infinity
-    if (dn > k) {
+    if (centers.has(n) || exempt.has(n)) continue
+    const s = slack.get(n) ?? -Infinity
+    if (s < 0) {
       dim.set(n, 'outer')
       continue
     }
     if (onCycleWithCenter(n)) continue
-    if (dn === k) dim.set(n, 'outer')
-    else if (k >= 3 && dn === k - 1) dim.set(n, 'near')
+    if (s === 0) dim.set(n, 'outer')
+    else if (s === 1 && (slackK.get(n) ?? 0) >= 3) dim.set(n, 'near')
   }
   return dim
 }

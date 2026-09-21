@@ -13,6 +13,7 @@ import {
   axisTicks,
   compactEdges,
   defaultGeom,
+  fociOf,
   formatOrderValue,
   groupOpts,
   LANE_GAP,
@@ -56,15 +57,20 @@ const CROSSHAIR =
       '</g></svg>',
   )
 
-/** The opacity an element's stylesheet resolves to (for animation targets). */
+/** The element opacity an element's stylesheet resolves to (for animation
+ * targets). Fringe NODES dim via component opacities (fill, label,
+ * crosshair) so their selection border stays bright — their element opacity
+ * is 1; fringe edges dim as whole elements. */
 const targetOpacity = (ele: cytoscape.SingularElementReturnValue): number =>
-  ele.hasClass('rail')
-    ? 0.75
-    : ele.hasClass('fringe-outer')
-      ? FRINGE_OUTER_OPACITY
-      : ele.hasClass('fringe-near')
-        ? FRINGE_NEAR_OPACITY
-        : 1
+  ele.group() === 'nodes'
+    ? 1
+    : ele.hasClass('rail')
+      ? 0.75
+      : ele.hasClass('fringe-outer')
+        ? FRINGE_OUTER_OPACITY
+        : ele.hasClass('fringe-near')
+          ? FRINGE_NEAR_OPACITY
+          : 1
 
 export const cyRef: { current: cytoscape.Core | null } = { current: null }
 
@@ -91,6 +97,9 @@ interface KgeScratch {
   /** skewer -> its ALIGNED bundle mates: they follow its every drag, keeping
    * only their sideways offsets. */
   alignPeers: Map<string, string[]>
+  /** skewer -> its GROUPED bundle mates: rail drags translate them rigidly
+   * along (each keeps its own position, angle, and length). */
+  groupPeers: Map<string, string[]>
   axisSkewers: Set<string> // skewers whose group draws an axis (dragfree must rebuild it)
 }
 
@@ -99,22 +108,31 @@ const scratch = (cy: cytoscape.Core): KgeScratch =>
     memberOf: new Map(),
     rigs: {},
     alignPeers: new Map(),
+    groupPeers: new Map(),
     axisSkewers: new Set(),
   }
 
 const handleId = (skewer: string, end: 'a' | 'b') => `skh:${end}:${skewer}`
 
 /** Reflect the two-slot selection as element classes (skewers select via
- * their rail — every segment of it). */
+ * their rail — every segment of it). A primary NODE also marks its incident
+ * graph edges, which draw thicker — the selection's edges stand out even
+ * when the node sits in a dense or dimmed neighborhood. */
 function applySel(cy: cytoscape.Core, primary: Sel | null, secondary: Sel | null): void {
   cy.elements('.sel-primary').removeClass('sel-primary')
   cy.elements('.sel-secondary').removeClass('sel-secondary')
+  cy.elements('.sel-incident').removeClass('sel-incident')
   const elOf = (s: Sel) =>
     s.kind === 'skewer'
       ? cy.edges('.rail').filter((e) => e.data('skewer') === s.id)
       : cy.$id(s.id)
   if (secondary) elOf(secondary).addClass('sel-secondary')
-  if (primary) elOf(primary).addClass('sel-primary')
+  if (primary) {
+    const el = elOf(primary)
+    el.addClass('sel-primary')
+    // '[etype]' keeps this to real graph edges — rail segments stay put.
+    if (primary.kind === 'node') el.connectedEdges('[etype]').addClass('sel-incident')
+  }
 }
 
 /** Viewport center in graph coordinates — where new nodes appear. */
@@ -144,12 +162,26 @@ export function skewerFromSelection(): void {
   const cy = cyRef.current
   const st = useStore.getState()
   if (!cy || !st.graph) return
-  const sel = cy.nodes(':selected')
-  if (sel.length < 2) {
-    st.setStatus('select at least 2 nodes to skewer')
+  // Native multi-select (shift-click / box) wins; else fall back to the
+  // two-slot click selection — clicking two nodes is enough for a pair.
+  let picked = cy.nodes(':selected').map((n) => n.id())
+  if (picked.length < 2) {
+    picked = [
+      ...new Set(
+        [st.secondary, st.primary]
+          .filter((s): s is Sel => s !== null && s.kind === 'node')
+          .map((s) => s.id),
+      ),
+    ]
+  }
+  const pts = picked.flatMap((nid) => {
+    const n = cy.$id(nid)
+    return n.nonempty() ? [{ id: nid, p: { ...n.position() } }] : []
+  })
+  if (pts.length < 2) {
+    st.setStatus('select at least 2 nodes to skewer (click two, or shift/box-select)')
     return
   }
-  const pts = sel.map((n) => ({ id: n.id(), p: { ...n.position() } }))
   const xs = pts.map((o) => o.p.x)
   const ys = pts.map((o) => o.p.y)
   const axis: 'x' | 'y' =
@@ -787,7 +819,7 @@ export function GraphCanvas() {
             width: 11,
             height: 11,
             shape: 'diamond',
-            'background-color': '#5f6368',
+            'background-color': 'data(tint)', // the rail's dark-end color (see ramp)
             label: '',
           },
         },
@@ -797,10 +829,10 @@ export function GraphCanvas() {
             width: 18,
             height: 18,
             shape: 'ellipse',
-            'background-color': '#5f6368',
+            'background-color': 'data(tint)',
             label: 'data(label)',
             'font-size': 9,
-            color: '#5f6368',
+            color: 'data(tint)',
             'text-valign': 'bottom',
             'text-margin-y': 5,
           },
@@ -824,6 +856,9 @@ export function GraphCanvas() {
             'text-background-padding': '2',
           } as never,
         },
+        // Edges touching the primary-selected node thicken so its
+        // connections read at a glance.
+        { selector: 'edge.sel-incident', style: { width: 4 } },
         { selector: 'edge:selected', style: { width: 4 } },
         {
           selector: 'edge.sel-secondary',
@@ -887,8 +922,27 @@ export function GraphCanvas() {
           selector: 'edge.axis-line',
           style: { width: 2, 'curve-style': 'straight', 'line-color': '#cbd5e1' } as never,
         },
-        { selector: '.fringe-near', style: { opacity: FRINGE_NEAR_OPACITY } },
-        { selector: '.fringe-outer', style: { opacity: FRINGE_OUTER_OPACITY } },
+        // Fringe nodes dim by their components — fill, label, crosshair —
+        // not element opacity, so a selection border still draws bright on a
+        // dimmed node. Edges have no such marker; they dim wholesale.
+        {
+          selector: 'node.fringe-near',
+          style: {
+            'background-opacity': FRINGE_NEAR_OPACITY,
+            'text-opacity': FRINGE_NEAR_OPACITY,
+            'background-image-opacity': FRINGE_NEAR_OPACITY,
+          } as never,
+        },
+        {
+          selector: 'node.fringe-outer',
+          style: {
+            'background-opacity': FRINGE_OUTER_OPACITY,
+            'text-opacity': FRINGE_OUTER_OPACITY,
+            'background-image-opacity': FRINGE_OUTER_OPACITY,
+          } as never,
+        },
+        { selector: 'edge.fringe-near', style: { opacity: FRINGE_NEAR_OPACITY } },
+        { selector: 'edge.fringe-outer', style: { opacity: FRINGE_OUTER_OPACITY } },
       ],
     })
     cyRef.current = cy
@@ -1047,6 +1101,7 @@ export function GraphCanvas() {
       if (!scratch(cy).rigs[skewer]) return
       railDrag = { skewer, last: { ...evt.position }, moved: 0, active: false }
       cy.userPanningEnabled(false)
+      cy.boxSelectionEnabled(false) // else the drag also paints a selection box
     })
     cy.on('tapdrag', (evt) => {
       if (!railDrag) return
@@ -1068,6 +1123,23 @@ export function GraphCanvas() {
       cy.$id(handleId(railDrag.skewer, 'b')).position({ ...rig.geom.b })
       for (const [id, p] of Object.entries(placeAlong(rig.geom, rig.visMembers, rig.ts)))
         cy.$id(id).position(p)
+      // GROUPED bundle mates ride along rigidly: same delta, own geometry.
+      // Aligned mates are skipped here — syncBundle below conforms them, and
+      // applying both would move them twice.
+      const aligned = new Set(sc.alignPeers.get(railDrag.skewer) ?? [])
+      for (const pid of sc.groupPeers.get(railDrag.skewer) ?? []) {
+        const peer = sc.rigs[pid]
+        if (!peer || peer.geom.pinned || aligned.has(pid)) continue
+        peer.geom = {
+          a: { x: peer.geom.a.x + dx, y: peer.geom.a.y + dy },
+          b: { x: peer.geom.b.x + dx, y: peer.geom.b.y + dy },
+          pinned: peer.geom.pinned,
+        }
+        cy.$id(handleId(pid, 'a')).position({ ...peer.geom.a })
+        cy.$id(handleId(pid, 'b')).position({ ...peer.geom.b })
+        for (const [id, p] of Object.entries(placeAlong(peer.geom, peer.visMembers, peer.ts)))
+          cy.$id(id).position(p)
+      }
       syncBundle(railDrag.skewer, rig.geom)
     })
     cy.on('tapend', () => {
@@ -1075,12 +1147,17 @@ export function GraphCanvas() {
       const { skewer, active } = railDrag
       railDrag = null
       cy.userPanningEnabled(true)
+      cy.boxSelectionEnabled(true)
       if (!active) return
       const st = useStore.getState()
       const sc = scratch(cy)
       const rig = sc.rigs[skewer]
       if (!rig) return
-      for (const pid of sc.alignPeers.get(skewer) ?? []) {
+      const peers = new Set([
+        ...(sc.alignPeers.get(skewer) ?? []),
+        ...(sc.groupPeers.get(skewer) ?? []),
+      ])
+      for (const pid of peers) {
         const peer = sc.rigs[pid]
         if (peer && !peer.geom.pinned) st.setSkewerGeom(pid, peer.geom)
       }
@@ -1118,8 +1195,10 @@ export function GraphCanvas() {
     const rigs: Record<string, Rig> = {}
     const derived: Record<string, Position> = {}
     const alignPeers = new Map<string, string[]>()
+    const groupPeers = new Map<string, string[]>()
     const axisSkewers = new Set<string>()
     const alignIds = new Map<string, string[]>() // aligned bundle -> rig'd skewers
+    const groupedIds = new Map<string, string[]>() // grouped bundle -> rig'd skewers
     const groupGeoms = new Map<string, SkewerGeom[]>() // bundle -> rig'd rail geoms (for the axis)
     for (const s of skewersOf(g)) {
       if (!skewerShown(v, s.id)) continue
@@ -1138,11 +1217,15 @@ export function GraphCanvas() {
         const opts = groupOpts(v, s.group)
         groupGeoms.set(s.group, [...(groupGeoms.get(s.group) ?? []), geom])
         if (opts.align) alignIds.set(s.group, [...(alignIds.get(s.group) ?? []), s.id])
+        if (opts.grouped) groupedIds.set(s.group, [...(groupedIds.get(s.group) ?? []), s.id])
         if (opts.axis) axisSkewers.add(s.id)
       }
     }
     for (const ids of alignIds.values()) {
       for (const id of ids) alignPeers.set(id, ids.filter((x) => x !== id))
+    }
+    for (const ids of groupedIds.values()) {
+      for (const id of ids) groupPeers.set(id, ids.filter((x) => x !== id))
     }
 
     // Unseeded free nodes appear near the centroid of everything placed.
@@ -1170,7 +1253,7 @@ export function GraphCanvas() {
         pinned.has(n.id) ? 'pinned' : '',
         memberOf.has(n.id) ? 'skewer-member' : '',
         dimClass(dim.get(n.id)),
-        n.id === v.focus?.node ? 'focus-center' : '',
+        fociOf(v).some((f) => f.node === n.id) ? 'focus-center' : '',
       ]
         .filter(Boolean)
         .join(' ')
@@ -1232,11 +1315,23 @@ export function GraphCanvas() {
       })
     }
     for (const [id, rig] of Object.entries(rigs)) {
-      const label = g.nodes.find((n) => n.id === id)?.label || id
+      const skNode = g.nodes.find((n) => n.id === id)
+      const label = skNode?.label || id
+      // The schema's color binding reaches rails too: a skewer node carrying
+      // the bound field (data[colorKey]) tints its whole rail — the tip,
+      // handles, and bulb take the bound color exactly (matching the
+      // legend), the base a whitened version. Pinned red still wins.
+      const bound = skNode ? nodeColor(g.schema, skNode, '') : ''
+      const ramp = rig.geom.pinned
+        ? RAIL_PINNED_RAMP
+        : bound
+          ? [lerpHex('#ffffff', bound, 0.35), bound]
+          : RAIL_RAMP
+      const tint = ramp[1]
       for (const end of ['a', 'b'] as const) {
         elements.push({
           group: 'nodes',
-          data: { id: handleId(id, end), skewer: id, end, ...(end === 'a' ? { label } : {}) },
+          data: { id: handleId(id, end), skewer: id, end, tint, ...(end === 'a' ? { label } : {}) },
           position: { ...rig.geom[end] },
           // The a end is the labeled bulb at the base; b is the grip under the arrowhead.
           classes: end === 'a' ? 'skewer-handle skewer-bulb' : 'skewer-handle',
@@ -1245,13 +1340,17 @@ export function GraphCanvas() {
       }
       // The rail: bulb → members in order → arrow grip, one segment per hop.
       const path = [handleId(id, 'a'), ...rig.chain, handleId(id, 'b')]
-      const ramp = rig.geom.pinned ? RAIL_PINNED_RAMP : RAIL_RAMP
       const segs = path.length - 1
       for (let i = 0; i < segs; i++) {
         elements.push({
           group: 'edges',
           data: {
-            id: `rail:${id}:${i}`,
+            // The id encodes the endpoints: cytoscape edges can't be rewired,
+            // so when the chain changes (focus walk banishing members) a
+            // segment with new endpoints must be a NEW element — a positional
+            // id would be "kept" by the fade transition still wired to a
+            // removed node, and vanish with it.
+            id: `rail:${id}:${path[i]}>${path[i + 1]}`,
             source: path[i],
             target: path[i + 1],
             skewer: id,
@@ -1278,7 +1377,7 @@ export function GraphCanvas() {
       elements.push(...axisElements(group, opts.axis, geoms))
     }
 
-    cy.scratch('kge', { memberOf, rigs, alignPeers, axisSkewers } satisfies KgeScratch)
+    cy.scratch('kge', { memberOf, rigs, alignPeers, groupPeers, axisSkewers } satisfies KgeScratch)
     const animate = st.animateNext && !firstBuild.current && cy.elements().length > 0
     if (st.animateNext) useStore.setState({ animateNext: false })
 
@@ -1305,6 +1404,12 @@ export function GraphCanvas() {
         // Kept: crossfade if its fringe level changed, glide if it re-spaced.
         const before = Number(ele.style('opacity'))
         ele.classes((def.classes as string) ?? '')
+        // Refresh data in place (rail ramp colors shift with the chain,
+        // tints and labels change); id and endpoints are immutable — an
+        // endpoint change produces a new element id instead.
+        for (const [k, val] of Object.entries(def.data ?? {})) {
+          if (k !== 'id' && k !== 'source' && k !== 'target') ele.data(k, val as never)
+        }
         const after = targetOpacity(ele)
         if (Math.abs(after - before) > 0.01) {
           ele.style('opacity', before)

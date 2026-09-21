@@ -1,9 +1,14 @@
-"""The file store: graph/ is the source of truth, checked into git.
+"""The file store: graph dirs are the source of truth, checked into git.
 
-    graph/schema.json        node/edge type vocabulary
-    graph/nodes.json         {"nodes": [...]}, sorted by id
-    graph/edges.json         {"edges": [...]}, sorted by (from, type, to)
-    graph/views/<id>.json    one file per view (type filters + layout hints)
+    <dir>/schema.json        node/edge type vocabulary
+    <dir>/nodes.json         {"nodes": [...]}, sorted by id
+    <dir>/edges.json         {"edges": [...]}, sorted by (from, type, to)
+    <dir>/views/<id>.json    one file per view (type filters + layout hints)
+
+A GraphStore is one graph directory. A GraphRegistry names several of them —
+explicit dirs (id = the dir's basename) plus an optional root whose immediate
+subdirs are graphs — and rescans on every call, so a graph dir that appears
+under the root (git pull, mkdir) is served without a restart.
 
 Save rewrites everything (the clients send whole state — clobber, never
 merge), sorted and pretty-printed so diffs stay reviewable. Each file is
@@ -14,6 +19,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 
 from kge.models import Graph, GraphSchema, View
@@ -104,3 +111,79 @@ class GraphStore:
                 self.views_dir / "default.json",
                 View(id="default", name="Default").model_dump(by_alias=True),
             )
+
+
+GRAPH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+class GraphRegistry:
+    """The set of graphs the server offers, keyed by id.
+
+    Two sources, combined: explicit graph dirs (id = the dir's basename) and a
+    scan root whose immediate subdirs holding a schema.json are graphs (id =
+    the subdir's name). Explicit dirs win id collisions. `stores()` rescans
+    the root every call — the files are the source of truth, so new graph
+    dirs appear (and deleted ones vanish) without a server restart.
+    """
+
+    def __init__(self, dirs: list[Path] | None = None, root: Path | None = None):
+        self.dirs = [d.resolve() for d in (dirs or [])]
+        self.root = root.resolve() if root else None
+
+    def stores(self) -> dict[str, GraphStore]:
+        out: dict[str, GraphStore] = {d.name: GraphStore(d) for d in self.dirs}
+        if self.root and self.root.is_dir():
+            for d in sorted(self.root.iterdir()):
+                if d.is_dir() and (d / "schema.json").is_file() and d.name not in out:
+                    out[d.name] = GraphStore(d)
+        return out
+
+    def get(self, graph_id: str) -> GraphStore | None:
+        return self.stores().get(graph_id)
+
+    def default_id(self) -> str | None:
+        """The graph unqualified requests (/api/graph, CLI without --graph) mean:
+        the first explicit dir, else the root's 'default' subdir, else the
+        root's alphabetically first subdir."""
+        stores = self.stores()
+        if not stores:
+            return None
+        if self.dirs:
+            return self.dirs[0].name
+        if "default" in stores:
+            return "default"
+        return next(iter(stores))
+
+    def create(self, graph_id: str) -> GraphStore:
+        """Seed a new empty graph under the scan root."""
+        if self.root is None:
+            raise ValueError("this server has no graphs root; new graphs can't be created here")
+        if not GRAPH_ID_RE.fullmatch(graph_id):
+            raise ValueError(f"bad graph id '{graph_id}' (letters, digits, . _ - only)")
+        if graph_id in self.stores():
+            raise ValueError(f"graph already exists: {graph_id}")
+        store = GraphStore(self.root / graph_id)
+        store.ensure()
+        return store
+
+    def delete(self, graph_id: str) -> None:
+        """Remove a graph's directory. Only root-scanned graphs can go (an
+        explicit --graph-dir was asked for by name at startup), and never
+        the last graph. Git history is the undo."""
+        stores = self.stores()
+        if graph_id not in stores:
+            raise ValueError(f"no such graph: {graph_id}")
+        if len(stores) <= 1:
+            raise ValueError("the last graph cannot be deleted")
+        target = stores[graph_id].dir
+        if target in self.dirs or self.root is None or target.parent != self.root:
+            raise ValueError(
+                f"{graph_id} is served from an explicit --graph-dir; remove its directory yourself"
+            )
+        shutil.rmtree(target)
+
+    def audit_dir(self) -> Path:
+        """One audit log per server: at the scan root if there is one, else
+        alongside the first explicit graph (the pre-multigraph location)."""
+        base = self.root if self.root else (self.dirs[0] if self.dirs else Path("."))
+        return base / ".audit"

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TypeDef(BaseModel):
@@ -81,6 +81,9 @@ class Layout(BaseModel):
 
 
 class Focus(BaseModel):
+    """One focus center: its k-hop neighborhood is part of what the view
+    shows. A view may hold several; their neighborhoods union."""
+
     node: str
     kHops: int = 2
 
@@ -103,13 +106,19 @@ class SkewerGroupOpts(BaseModel):
     order / proportional order / even) bake fractions into
     `layout.memberFracs`, and the user drags things around afterwards.
 
-    `align` is the one live constraint: rails share a direction and their
-    starts/ends stay colinear (aligned lanes) — moving or stretching one rail
-    moves them all, each keeping only its sideways offset. `axis` is set
-    while proportional order is applied and is drawn as the floating axis.
+    `align` and `grouped` are the live constraints — mutually exclusive drag
+    policies (the UI unchecks one when the other is checked). `align`: rails
+    share a direction and their starts/ends stay colinear (aligned lanes) —
+    moving or stretching one rail moves them all, each keeping only its
+    sideways offset. `grouped`: dragging any rail translates the whole
+    bundle rigidly, each rail keeping its own position, angle, and length —
+    the handle for moving a bundle around without imposing alignment. `axis`
+    is set while proportional order is applied and is drawn as the floating
+    axis.
     """
 
     align: bool = False
+    grouped: bool = False
     axis: AxisInfo | None = None
 
 
@@ -123,7 +132,10 @@ class View(BaseModel):
     # overrides beneath it. Edge overrides use the 'type|from|to' key.
     nodeOverrides: list[str] = []
     edgeOverrides: list[str] = []
-    focus: Focus | None = None
+    # The view's focus centers; empty = no focus (everything included shows).
+    # Neighborhoods union. Files written before multi-focus carried a single
+    # `focus` object — the validator below migrates it on read.
+    foci: list[Focus] = []
     # Eye adjustments: manual display tweaks layered on top of the focus —
     # summon items the focus banished (focusShow) or banish shown ones
     # (focusHide). Distinct from inclusion: adjusted items stay part of the
@@ -133,6 +145,17 @@ class View(BaseModel):
     # Bundle options, keyed by the skewers' data.group (default: data.orderKey).
     skewerGroups: dict[str, SkewerGroupOpts] = {}
     layout: Layout = Layout()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_single_focus(cls, data):
+        """Pre-multifocus payloads carried `focus: {...}|null`; fold it into
+        `foci` so old files and old clients keep working."""
+        if isinstance(data, dict):
+            legacy = data.pop("focus", None)
+            if legacy and not data.get("foci"):
+                data = {**data, "foci": [legacy]}
+        return data
 
 
 class SelSlot(BaseModel):
@@ -152,6 +175,7 @@ class SelectionState(BaseModel):
 
     primary: SelSlot | None = None
     secondary: SelSlot | None = None
+    graph: str | None = None  # the graph the browser is showing
     view: str | None = None  # the view the browser is showing (for geometry queries)
 
 
@@ -186,6 +210,18 @@ class Graph(BaseModel):
                     errors.append(f"edge {e.type} {e.src} -> {e.dst}: no such node '{endpoint}'")
             if e.type == "skewer-order" and node_types.get(e.src) not in (None, "skewer"):
                 errors.append(f"skewer-order edge must originate from a skewer node, not {e.src}")
+        # One skewer per node: rails never share a member (it makes a mess of
+        # the view). Clients move a node between skewers rather than adding.
+        skewer_of: dict[str, str] = {}
+        for e in self.edges:
+            if e.type != "skewer-order":
+                continue
+            if e.dst in skewer_of and skewer_of[e.dst] != e.src:
+                errors.append(
+                    f"node {e.dst} is on multiple skewers ({skewer_of[e.dst]}, {e.src}); "
+                    "a node can ride only one"
+                )
+            skewer_of[e.dst] = e.src
         view_ids: set[str] = set()
         for v in self.views:
             if v.id in view_ids:
@@ -215,5 +251,4 @@ class Graph(BaseModel):
             v.edgeOverrides = [k for k in v.edgeOverrides if k in edge_keys]
             v.focusShow = [i for i in v.focusShow if i in node_ids or i in edge_keys]
             v.focusHide = [i for i in v.focusHide if i in node_ids or i in edge_keys]
-            if v.focus and v.focus.node not in node_ids:
-                v.focus = None
+            v.foci = [f for f in v.foci if f.node in node_ids]

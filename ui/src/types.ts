@@ -62,6 +62,8 @@ export interface LayoutHints {
   rules: unknown[]
 }
 
+/** One focus center: its k-hop neighborhood is part of what the view shows.
+ * A view may hold several; their neighborhoods union. */
 export interface Focus {
   node: string
   kHops: number
@@ -81,10 +83,14 @@ export interface AxisInfo {
  * spacing ACTIONS bake fractions into layout.memberFracs, which the user is
  * then free to drag around. */
 export interface SkewerGroupOpts {
-  /** The one live constraint: rails share a direction and their starts/ends
-   * stay colinear (aligned lanes) — dragging or stretching one rail moves
-   * them all, each keeping only its sideways offset. */
+  /** Live constraint: rails share a direction and their starts/ends stay
+   * colinear (aligned lanes) — dragging or stretching one rail moves them
+   * all, each keeping only its sideways offset. */
   align: boolean
+  /** Live constraint: dragging any rail translates the whole bundle rigidly
+   * — each rail keeps its own position, angle, and length. The handle for
+   * moving a bundle around without imposing alignment. */
+  grouped?: boolean
   /** Set while proportional order is applied; drawn as the floating axis. */
   axis?: AxisInfo | null
 }
@@ -98,7 +104,9 @@ export interface View {
    * type or family clobbers (clears) the overrides beneath it. */
   nodeOverrides: string[]
   edgeOverrides: string[] // edge keys 'type|from|to'
-  focus: Focus | null
+  /** Focus centers; empty = no focus. The server migrates pre-multifocus
+   * payloads (single `focus` field) into this on read. */
+  foci: Focus[]
   /** Eye adjustments layered on the focus: summon (focusShow) or banish
    * (focusHide) individual items without changing inclusion. Cleared by any
    * focus recenter — the hop algorithm recomputes from scratch. */
@@ -116,6 +124,15 @@ export interface GraphPayload {
   nodes: NodeT[]
   edges: EdgeT[]
   views: View[]
+}
+
+/** One entry of GET /api/graphs — a graph the server offers. */
+export interface GraphInfo {
+  id: string
+  nodes: number
+  edges: number
+  views: number
+  default: boolean
 }
 
 /** One selection slot. Edge ids use the edge key form 'type|from|to'. */

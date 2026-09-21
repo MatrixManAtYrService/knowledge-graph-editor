@@ -95,24 +95,29 @@ def visible_sets(graph: Graph, view: View) -> tuple[set[str], list[Edge]]:
         shown = edge_type_checked(e.type) != (key in e_ov)
         return shown and e.src in nodes and e.dst in nodes
 
-    if view.focus and view.focus.node in nodes:
+    foci = [f for f in view.foci if f.node in nodes]
+    if foci:
         adj: dict[str, list[str]] = {}
         for e in graph.edges:
             if not edge_visible(e):
                 continue
             adj.setdefault(e.src, []).append(e.dst)
             adj.setdefault(e.dst, []).append(e.src)
-        dist = {view.focus.node: 0}
-        queue = [view.focus.node]
-        while queue:
-            cur = queue.pop(0)
-            if dist[cur] >= view.focus.kHops:
-                continue
-            for nxt in adj.get(cur, []):
-                if nxt not in dist:
-                    dist[nxt] = dist[cur] + 1
-                    queue.append(nxt)
-        nodes = {n for n in nodes if n in dist}
+        # Union of the foci's k-hop neighborhoods (each focus its own radius).
+        reach: set[str] = set()
+        for f in foci:
+            dist = {f.node: 0}
+            queue = [f.node]
+            while queue:
+                cur = queue.pop(0)
+                if dist[cur] >= f.kHops:
+                    continue
+                for nxt in adj.get(cur, []):
+                    if nxt not in dist:
+                        dist[nxt] = dist[cur] + 1
+                        queue.append(nxt)
+            reach |= dist.keys()
+        nodes = {n for n in nodes if n in reach}
 
     # Eye adjustments on top of the focus: summon included items back, banish
     # shown ones. (Summoned edges still need both endpoints shown to render.)

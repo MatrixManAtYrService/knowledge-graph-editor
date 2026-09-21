@@ -1,8 +1,10 @@
 # knowledge-graph-editor (kge)
 
-A knowledge graph collaboratively edited by humans (browser UI) and agents
+Knowledge graphs collaboratively edited by humans (browser UI) and agents
 (CLI). The source of truth is JSON files checked into this repo; a small
-server loads them and serves the whole graph to both kinds of client.
+server loads them and serves whole graphs to both kinds of client. One
+server can offer several graphs — the toolbar has a graph picker beside the
+view picker, and the CLI takes `--graph`/`-g` (or `$KGE_GRAPH`).
 
 ## Use it from your own repo (no clone, no node, no nix)
 
@@ -63,17 +65,33 @@ uv run kge --help           # every subcommand has its own --help
 
 ## Files
 
-- `graph/schema.json` — node/edge type vocabulary: display color,
+Each graph is one directory. `kge serve` with no options serves the
+subdirectories of `./graphs` if that exists (one graph per subdir, the
+subdir name is the graph id, rescanned per request so a new dir appears
+without a restart), else the single `./graph` directory (seeding it if
+missing). `--graph-dir` (repeatable) and `--graphs-dir` override; the first
+explicit dir — else `graphs/default`, else the alphabetically first — is the
+*default graph*, the one unqualified CLI commands and the pre-multigraph
+`/api/graph` endpoint mean. `kge add-graph <id>` (or the **+** beside the
+UI's graph picker) seeds a new empty graph under the root; `kge rm-graph`
+(or the **−**) deletes one — root-scanned graphs only, never the last one,
+and git history is the undo. Within a graph directory:
+
+- `schema.json` — node/edge type vocabulary: display color,
   description, and `family` (the grouping level above type in the UI tree).
   Optionally `colorKey`, a node-data field that binds node color: nodes
   sharing a value of `data[colorKey]` share a color, overriding their type
   color (whatever the field means to your data — an author, a component, a
   status). `colorValues` pins colors for specific values; the rest get
-  stable palette picks. The sidebar shows the resulting legend.
-- `graph/nodes.json`, `graph/edges.json` — the graph, sorted for stable
+  stable palette picks. The sidebar shows the resulting legend. The binding
+  reaches rails too: a `skewer` node carrying the field tints its rail —
+  arrowhead, grip, and bulb in the exact legend color, base whitened
+  (pinned red still wins) — so a rail can visibly belong to its group.
+- `nodes.json`, `edges.json` — the graph, sorted for stable
   diffs. Nodes: `{id, type, label, data}`. Edges: `{type, from, to, data}`
   (by convention `data.note` carries `file:line` evidence).
-- `graph/views/<id>.json` — one file per saved view (see Views).
+- `views/<id>.json` — one file per saved view (see Views). Views belong to
+  their graph: switching graphs in the UI swaps the view picker's entries.
 
 ## Skewers
 
@@ -88,10 +106,11 @@ nodes on a shish-kebab spit:
 
 The UI never draws the raw skewer node. It renders a rail — a light→dark
 chain ending in an arrowhead, the name in a bulb at the base — that threads
-through its members *in order*. A node can sit on several skewers: exactly
-one (the lowest `data.priority`, then id order) **owns** it and spaces it
-evenly along its straight baseline; every other rail through it bends at
-its actual position, tube-map style. Filtering compacts a rail instantly
+through its members *in order*, spacing them evenly along its straight
+baseline. A node rides at most one skewer — rails sharing members made a
+mess of the view, so adding a node to another skewer *moves* it (the UI's
+⊕, the CLI, and save-time validation all enforce this).
+Filtering compacts a rail instantly
 while preserving its order. Three drags do three things: drag the **rail**
 to move the whole skewer, drag an **end handle** to rotate or stretch the
 baseline, and drag a **member** to slide it along the rail — hand-placement
@@ -109,14 +128,18 @@ bundles and lets you enable/disable rails singly or as a bundle — disabled
 rails release their members to float free, the nodes themselves stay — plus
 three per-bundle, per-view options:
 
-Below the rails sit one live constraint and a row of one-shot arrangement
+Below the rails sit two live constraints and a row of one-shot arrangement
 actions — apply one, then drag things wherever you like; changing course
 means applying a different action, not unchecking a box:
 
-- **align** (checkbox, the one live constraint) — the bundle's rails share
-  a direction and their starts and ends stay colinear; dragging or
-  stretching one rail moves them all, each keeping only its sideways lane
-  offset.
+- **align** (checkbox, live) — the bundle's rails share a direction and
+  their starts and ends stay colinear; dragging or stretching one rail
+  moves them all, each keeping only its sideways lane offset.
+- **group** (checkbox, live) — dragging any rail translates the whole
+  bundle rigidly, each rail keeping its own position, angle, and length:
+  the handle for repositioning a bundle without imposing alignment. Align
+  and group are mutually exclusive drag policies — checking one unchecks
+  the other. Pinned rails stay put in both modes.
 - **make equidistant** — snap the rails onto evenly spaced lanes, keeping
   their order (a pinned rail anchors the grid).
 - **rotate 90°** — turn the whole bundle a quarter turn about its center.
@@ -142,16 +165,29 @@ re-apply an action (or "space evenly per skewer") to re-derive.
 ## Views
 
 A view is a saved perspective on the same graph: pick one in the toolbar,
-clone with **New view**, drop with **Delete view**. Each view stores:
+clone or drop one with the **+** / **−** beside the picker (like graphs, a
+new view lives in your edit buffer until you Save). Node and edge creation
+sit atop the sidebar's nodes and edges sections (**new node**, and
+**connect**, which joins the secondary-selected node to the primary); each
+tree row carries micro-actions — a pushpin to pin/unpin nodes and skewers
+in place, **⊖** to delete the item from the graph, **⊘** to take a node off
+its skewers, and **⊕** on a skewer row to append the selected node. Each
+view stores:
 
 - **Inclusion** — the family → type → item tree in the sidebar. Checkboxes
   at every level; checking/unchecking a parent clobbers the overrides
   beneath it. This defines which data the view considers at all.
-- **Focus** — an optional center node + `focus-hops` radius. With **click
-  behavior: refocus**, every node click recenters the focus (a
-  "selection-walk": neighborhoods fade in/out and the viewport glides).
-  Switch to **view/edit** to click around without moving the focus — the
-  red crosshairs stay put. **Clear focus** / **Restore focus** toggle.
+- **Focus** — optional center nodes, each with a `focus-hops` radius; their
+  neighborhoods union. Click behavior picks what a node click does beyond
+  selecting: **refocus** makes the clicked node the only focus (a
+  "selection-walk": neighborhoods fade in/out and the viewport glides, and
+  eye adjustments reset); **add/remove focus** toggles — clicking a node
+  adds it as another center at the current `focus-hops`, clicking an
+  existing center (red crosshairs) removes that focus along with any
+  eye-summons within its reach, and nothing else is clobbered; **view/edit**
+  clicks around without touching the foci. The `focus-hops` box sets the
+  radius the next refocus/add uses — existing foci keep theirs. **Clear
+  focus** / **Restore focus** toggle the whole set.
 - **Eye adjustments** — the eye icons in the tree show what's actually on
   canvas and are clickable: summon items the focus banished, or banish shown
   ones, per item / type / family. Distinct from inclusion; cleared by the
@@ -187,7 +223,7 @@ entirely. A pinned rail anchors the whole grid.
 ## Selection is shared
 
 Every click publishes the two-slot selection (primary = latest click,
-secondary = the one before) and the current view to the server. Agents read
+secondary = the one before) and the current graph + view to the server. Agents read
 it with `kge selection` — "what is the human looking at" — and can answer
 questions about *this* node or *these two*. `kge find-collisions` reports
 what the selection spatially overlaps without being logically connected to;

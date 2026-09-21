@@ -6,23 +6,12 @@ import { edgeKey } from './types'
 
 function SkewerInspector({ skewerId }: { skewerId: string }) {
   const graph = useStore((s) => s.graph)!
-  const view = useStore((s) => s.view())!
-  const { setSkewerPinned } = useStore()
   const skewer = skewersOf(graph).find((s) => s.id === skewerId)
   if (!skewer) return null
-  const geom = view.layout.skewers[skewerId]
 
   return (
     <>
       <div className="field-id">{skewer.id}</div>
-      <label className="type-row">
-        <input
-          type="checkbox"
-          checked={geom?.pinned ?? false}
-          onChange={(e) => setSkewerPinned(skewerId, e.target.checked)}
-        />
-        pinned (layout won't move it)
-      </label>
       <h3>members (in order)</h3>
       <ol className="member-list">
         {skewer.members.map((m) => (
@@ -145,7 +134,9 @@ export function Inspector() {
     return (
       <div className="inspector">
         <h3>{multiNodes.length} nodes selected</h3>
-        <div className="hint">Skewer puts them on an ordered line; Pin freezes them in place.</div>
+        <div className="hint">
+          Use the sidebar's "new skewer from selected nodes" to put them on an ordered line.
+        </div>
       </div>
     )
   }

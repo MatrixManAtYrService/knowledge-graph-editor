@@ -10,10 +10,12 @@
 // (Skewer, Pin, Delete) via `multiNodes`.
 
 import { create } from 'zustand'
-import { fetchGraph, postSelection, putGraph } from './api'
+import { createGraph, deleteGraph, fetchGraph, fetchGraphs, postSelection, putGraph } from './api'
 import {
   alignGeom,
   computeBundleFracs,
+  fociOf,
+  focusReach,
   groupOpts,
   LANE_GAP,
   padScale,
@@ -24,11 +26,13 @@ import {
   snapLanes,
   visibleSets,
 } from './graph'
-import type { Focus, GraphPayload, Position, Sel, SkewerGeom, View } from './types'
+import type { Focus, GraphInfo, GraphPayload, Position, Sel, SkewerGeom, View } from './types'
 import { edgeKey } from './types'
 
 export interface KgeState {
   graph: GraphPayload | null
+  graphs: GraphInfo[] // what the server offers (the graph picker's entries)
+  graphId: string // which one `graph` is
   viewId: string
   dirty: boolean
   version: number
@@ -37,10 +41,13 @@ export interface KgeState {
   multiNodes: string[]
   connectEdgeType: string
   status: string
-  walkMode: boolean // refocus click behavior: focus follows every node click
-  focusHops: number // focus-hops used when (re)centering the focus
+  // What a node click does besides selecting: 'refocus' replaces the foci
+  // with the clicked node's neighborhood, 'toggle' adds the clicked node as
+  // a focus (or removes it if it already is one), 'view' just selects.
+  clickMode: 'refocus' | 'toggle' | 'view'
+  focusHops: number // the radius the NEXT refocus / add-focus click uses
   animateNext: boolean // the next canvas rebuild should fade/glide (set by focus changes)
-  stashedFocus: { focus: Focus; show: string[]; hide: string[] } | null // for Restore focus
+  stashedFocus: { foci: Focus[]; show: string[]; hide: string[] } | null // for Restore focus
 
   refresh: () => Promise<void>
   save: () => Promise<void>
@@ -50,6 +57,9 @@ export interface KgeState {
   tapSelect: (sel: Sel | null) => void
   setMultiNodes: (ids: string[]) => void
   setConnectEdgeType: (t: string) => void
+  setGraphId: (id: string) => void
+  addGraph: (id: string) => Promise<void>
+  removeGraph: (id: string) => Promise<void>
   setViewId: (id: string) => void
   addView: (id: string, name: string) => void
   removeView: (id: string) => void
@@ -57,6 +67,7 @@ export interface KgeState {
   addNode: (type: string, id: string, label: string, pos: Position) => void
   connect: () => void
   deleteSelection: () => void
+  deleteItems: (nodeIds: string[], edgeKeys: string[]) => void
   setNodeProps: (id: string, props: { type?: string; label?: string; data?: Record<string, unknown> }) => void
   setEdgeData: (key: string, data: Record<string, unknown>) => void
 
@@ -64,19 +75,20 @@ export interface KgeState {
   toggleOverride: (kind: 'node' | 'edge', id: string) => void
   setSkewersEnabled: (ids: string[], enabled: boolean) => void
   setBundleAlign: (group: string, on: boolean) => void
+  setBundleGrouped: (group: string, on: boolean) => void
   applyBundleSpacing: (group: string, mode: 'even' | 'order' | 'proportional') => void
   equalizeBundle: (group: string) => void
   rotateBundle: (group: string) => void
   padBundle: (group: string) => void
   setMemberFrac: (skewerId: string, nodeId: string, frac: number) => void
-  setWalkMode: (on: boolean) => void
+  setClickMode: (mode: KgeState['clickMode']) => void
   setFocusHops: (k: number) => void
   clearFocus: () => void
   restoreFocus: () => void
+  removeFocus: (node: string) => void
   adjustShown: (ids: string[], show: boolean) => void
   addToSkewer: (skewerId: string, nodeId: string) => void
   removeFromSkewer: (skewerId: string, nodeId: string) => void
-  setFocus: (node: string | null, kHops: number) => void
   setPositions: (positions: Record<string, Position>, opts?: { markDirty?: boolean }) => void
   createSkewer: (id: string, members: string[], geom: SkewerGeom) => void
   setSkewerGeom: (id: string, geom: SkewerGeom, opts?: { rebuild?: boolean }) => void
@@ -102,7 +114,7 @@ export const useStore = create<KgeState>((set, get) => {
 
   const setSelection = (primary: Sel | null, secondary: Sel | null) => {
     set({ primary, secondary })
-    postSelection(primary, secondary, get().viewId)
+    postSelection(primary, secondary, get().graphId, get().viewId)
   }
 
   const ensureSkewerTypes = (g: GraphPayload) => {
@@ -118,6 +130,8 @@ export const useStore = create<KgeState>((set, get) => {
 
   return {
     graph: null,
+    graphs: [],
+    graphId: '',
     viewId: 'default',
     dirty: false,
     version: 0,
@@ -126,35 +140,45 @@ export const useStore = create<KgeState>((set, get) => {
     multiNodes: [],
     connectEdgeType: '',
     status: '',
-    walkMode: false,
+    clickMode: 'view',
     focusHops: 2,
     animateNext: false,
     stashedFocus: null,
 
     refresh: async () => {
       try {
-        const g = await fetchGraph()
+        const graphs = await fetchGraphs()
+        // Keep the current graph if the server still offers it; else fall to
+        // the server's default. (First load: graphId is '' and falls too.)
+        const cur = get().graphId
+        const graphId = graphs.some((x) => x.id === cur)
+          ? cur
+          : (graphs.find((x) => x.default) ?? graphs[0])?.id
+        if (!graphId) throw new Error('the server offers no graphs')
+        const g = await fetchGraph(graphId)
         set((s) => ({
           graph: g,
+          graphs,
+          graphId,
           dirty: false,
           version: s.version + 1,
           viewId: g.views.some((v) => v.id === s.viewId) ? s.viewId : (g.views[0]?.id ?? 'default'),
           multiNodes: [],
           connectEdgeType: s.connectEdgeType || Object.keys(g.schema.edgeTypes)[0] || '',
-          status: `refreshed: ${g.nodes.length} nodes, ${g.edges.length} edges`,
+          status: `refreshed ${graphId}: ${g.nodes.length} nodes, ${g.edges.length} edges`,
         }))
-        setSelection(null, null) // after set: publishes the (possibly changed) view id
+        setSelection(null, null) // after set: publishes the (possibly changed) graph + view ids
       } catch (e) {
         set({ status: String(e) })
       }
     },
 
     save: async () => {
-      const g = get().graph
-      if (!g) return
+      const { graph: g, graphId } = get()
+      if (!g || !graphId) return
       try {
-        await putGraph(g)
-        set({ dirty: false, status: 'saved' })
+        await putGraph(graphId, g)
+        set({ dirty: false, status: `saved ${graphId}` })
       } catch (e) {
         set({ status: String(e) })
       }
@@ -169,7 +193,7 @@ export const useStore = create<KgeState>((set, get) => {
     setStatus: (status) => set({ status }),
 
     tapSelect: (sel) => {
-      const { primary, secondary, walkMode, focusHops } = get()
+      const { primary, secondary, clickMode, focusHops } = get()
       if (!sel) {
         if (primary || secondary) setSelection(null, null)
         return
@@ -177,13 +201,75 @@ export const useStore = create<KgeState>((set, get) => {
       if (!(primary && primary.kind === sel.kind && primary.id === sel.id)) {
         setSelection(sel, primary)
       }
-      // selection-walk: the focus follows each node click, summoning its
-      // neighborhood and banishing everything else.
-      if (walkMode && sel.kind === 'node') get().setFocus(sel.id, focusHops)
+      if (sel.kind !== 'node') return
+      if (clickMode === 'refocus') {
+        // selection-walk: the clicked node becomes the ONLY focus, and the
+        // adjustments recompute from scratch — eye tweaks don't survive.
+        set({ animateNext: true })
+        mut((_g, v) => {
+          v.foci = [{ node: sel.id, kHops: focusHops }]
+          v.focusShow = []
+          v.focusHide = []
+        })
+      } else if (clickMode === 'toggle') {
+        // One mode, both directions: a focus center clicked again is
+        // removed; any other node joins as a new center, its neighborhood
+        // unioning in. Unlike refocus this clobbers nothing — eye
+        // adjustments stay (removal sweeps only the removed focus's reach).
+        const v = get().view()
+        if (v && fociOf(v).some((f) => f.node === sel.id)) {
+          get().removeFocus(sel.id)
+        } else {
+          set({ animateNext: true })
+          mut((_g, view) => {
+            view.foci = [...fociOf(view), { node: sel.id, kHops: focusHops }]
+          })
+          set({ status: `focus added: ${sel.id} (${focusHops} hops)` })
+        }
+      }
     },
 
     setMultiNodes: (multiNodes) => set({ multiNodes }),
     setConnectEdgeType: (connectEdgeType) => set({ connectEdgeType }),
+
+    /** Switch graphs: drop the edit buffer and load the picked graph fresh
+     * (the caller confirms first when there are unsaved edits). The view
+     * picker re-buckets to the new graph's views inside refresh(). */
+    setGraphId: (graphId) => {
+      set({ graphId, viewId: 'default', stashedFocus: null })
+      void get().refresh()
+    },
+
+    addGraph: async (id) => {
+      if (!id.trim()) return set({ status: 'graph id must not be empty' })
+      try {
+        await createGraph(id.trim())
+        get().setGraphId(id.trim())
+        set({ status: `created graph ${id.trim()}` })
+      } catch (e) {
+        set({ status: String(e) })
+      }
+    },
+
+    removeGraph: async (id) => {
+      try {
+        await deleteGraph(id)
+      } catch (e) {
+        return set({ status: String(e) })
+      }
+      if (id === get().graphId) {
+        // The current graph went away: refresh falls to the server default.
+        await get().refresh()
+      } else {
+        // Just re-list; don't clobber the edit buffer over a bystander.
+        try {
+          set({ graphs: await fetchGraphs() })
+        } catch {
+          /* the next refresh will re-list */
+        }
+      }
+      set({ status: `deleted graph ${id}` })
+    },
 
     setViewId: (viewId) => {
       set((s) => ({ viewId, version: s.version + 1, multiNodes: [] }))
@@ -202,7 +288,7 @@ export const useStore = create<KgeState>((set, get) => {
         g.views.push(clone)
       })
       get().setViewId(id)
-      set({ status: `created view ${id} (a copy of ${viewId})` })
+      set({ status: `created view ${id} (a copy of ${viewId}) — in this tab only until you Save` })
     },
 
     removeView: (id) => {
@@ -250,13 +336,19 @@ export const useStore = create<KgeState>((set, get) => {
 
     deleteSelection: () => {
       const { primary, secondary, multiNodes } = get()
-      const nodeIds = new Set(multiNodes)
-      const edgeKeys = new Set<string>()
+      const nodeIds: string[] = [...multiNodes]
+      const edgeKeys: string[] = []
       for (const s of [primary, secondary]) {
         if (!s) continue
-        if (s.kind === 'edge') edgeKeys.add(s.id)
-        else nodeIds.add(s.id) // skewers are nodes too
+        if (s.kind === 'edge') edgeKeys.push(s.id)
+        else nodeIds.push(s.id) // skewers are nodes too
       }
+      get().deleteItems(nodeIds, edgeKeys)
+    },
+
+    deleteItems: (nodeIdList, edgeKeyList) => {
+      const nodeIds = new Set(nodeIdList)
+      const edgeKeys = new Set(edgeKeyList)
       if (!nodeIds.size && !edgeKeys.size) return
       mut((graph, v) => {
         if (nodeIds.size) {
@@ -267,7 +359,7 @@ export const useStore = create<KgeState>((set, get) => {
             delete v.layout.skewers[id]
           }
           v.layout.pinned = v.layout.pinned.filter((n) => !nodeIds.has(n))
-          if (v.focus && nodeIds.has(v.focus.node)) v.focus = null
+          v.foci = fociOf(v).filter((f) => !nodeIds.has(f.node))
         }
         if (edgeKeys.size) {
           graph.edges = graph.edges.filter((e) => !edgeKeys.has(edgeKey(e)))
@@ -276,8 +368,15 @@ export const useStore = create<KgeState>((set, get) => {
         v.focusShow = (v.focusShow ?? []).filter((i) => !gone(i))
         v.focusHide = (v.focusHide ?? []).filter((i) => !gone(i))
       })
-      setSelection(null, null)
-      set({ multiNodes: [] })
+      // Only the deleted items leave the selection; the rest stays put.
+      const { primary, secondary, multiNodes } = get()
+      const gone = (s: Sel | null) => (s ? nodeIds.has(s.id) || edgeKeys.has(s.id) : false)
+      if (gone(primary) || gone(secondary)) {
+        setSelection(gone(primary) ? null : primary, gone(secondary) ? null : secondary)
+      }
+      if (multiNodes.some((id) => nodeIds.has(id))) {
+        set({ multiNodes: multiNodes.filter((id) => !nodeIds.has(id)) })
+      }
     },
 
     setNodeProps: (id, props) => {
@@ -346,7 +445,13 @@ export const useStore = create<KgeState>((set, get) => {
     setBundleAlign: (group, on) => {
       mut((g, v) => {
         const cur = v.skewerGroups?.[group] ?? { align: false, axis: null }
-        v.skewerGroups = { ...(v.skewerGroups ?? {}), [group]: { ...cur, align: on } }
+        // align and grouped are mutually exclusive drag policies: checking
+        // one unchecks the other (align's conform already carries the
+        // bundle, so stacking grouped on top double-moves rails).
+        v.skewerGroups = {
+          ...(v.skewerGroups ?? {}),
+          [group]: { ...cur, align: on, grouped: on ? false : cur.grouped },
+        }
         // Turning align on conforms the bundle now: every enabled rail takes
         // the reference's segment (a pinned rail if there is one, else the
         // highest-priority one), keeping only its own sideways offset.
@@ -360,6 +465,19 @@ export const useStore = create<KgeState>((set, get) => {
         for (const { id, geom } of geoms) {
           if (id === ref.id || geom.pinned) continue
           v.layout.skewers[id] = alignGeom(ref.geom, geom)
+        }
+      })
+    },
+
+    /** Grouped is pure drag behavior (rail drags translate the bundle
+     * rigidly) — toggling it moves nothing now, so no conforming pass.
+     * Mutually exclusive with align (see setBundleAlign). */
+    setBundleGrouped: (group, on) => {
+      mut((_g, v) => {
+        const cur = v.skewerGroups?.[group] ?? { align: false, axis: null }
+        v.skewerGroups = {
+          ...(v.skewerGroups ?? {}),
+          [group]: { ...cur, grouped: on, align: on ? false : cur.align },
         }
       })
     },
@@ -505,14 +623,23 @@ export const useStore = create<KgeState>((set, get) => {
         (e) => e.type === SKEWER_EDGE && e.from === skewerId && e.to === nodeId,
       )
       if (already) return set({ status: `${nodeId} is already on ${skewerId}` })
+      const prev = g.edges
+        .filter((e) => e.type === SKEWER_EDGE && e.to === nodeId)
+        .map((e) => e.from)
       mut((graph) => {
+        // One skewer per node: joining this rail leaves any other.
+        graph.edges = graph.edges.filter((e) => !(e.type === SKEWER_EDGE && e.to === nodeId))
         const indexes = graph.edges
           .filter((e) => e.type === SKEWER_EDGE && e.from === skewerId)
           .map((e, i) => (typeof e.data.index === 'number' ? (e.data.index as number) : i))
         const next = indexes.length ? Math.max(...indexes) + 1 : 0
         graph.edges.push({ type: SKEWER_EDGE, from: skewerId, to: nodeId, data: { index: next } })
       })
-      set({ status: `added ${nodeId} to ${skewerId}` })
+      set({
+        status: prev.length
+          ? `moved ${nodeId} from ${prev.join(', ')} to ${skewerId}`
+          : `added ${nodeId} to ${skewerId}`,
+      })
     },
 
     removeFromSkewer: (skewerId, nodeId) => {
@@ -524,37 +651,51 @@ export const useStore = create<KgeState>((set, get) => {
       set({ status: `removed ${nodeId} from ${skewerId}` })
     },
 
-    // Mode is just a click policy — switching it never touches the focus.
-    setWalkMode: (on) => set({ walkMode: on }),
+    // Mode is just a click policy — switching it never touches the foci.
+    setClickMode: (mode) => set({ clickMode: mode }),
 
-    setFocusHops: (k) => {
-      const clamped = Math.max(1, Math.min(10, k))
-      set({ focusHops: clamped })
-      const focus = get().view()?.focus
-      if (focus) get().setFocus(focus.node, clamped)
-    },
+    // The slider sets the radius for the NEXT refocus / add-focus click;
+    // existing foci keep theirs (re-click a center in add mode to re-read it).
+    setFocusHops: (k) => set({ focusHops: Math.max(1, Math.min(10, k)) }),
 
-    setFocus: (node, kHops) => {
-      set({ animateNext: true }) // focus changes fade/glide instead of snapping
-      mut((_g, v) => {
-        v.focus = node ? { node, kHops } : null
-        // A recenter recomputes from scratch: eye adjustments don't survive.
-        v.focusShow = []
-        v.focusHide = []
+    /** Drop one focus center. Its explicit eye-summons go with it — anything
+     * the user summoned within the removed focus's reach — while summons in
+     * other foci's territory survive. */
+    removeFocus: (node) => {
+      const { graph } = get()
+      const v = get().view()
+      if (!graph || !v) return
+      const target = fociOf(v).find((f) => f.node === node)
+      if (!target) {
+        return set({ status: 'click a focus center (red crosshairs) to remove it' })
+      }
+      const reach = focusReach(graph, v, target.node, target.kHops)
+      set({ animateNext: true })
+      mut((_g, view) => {
+        view.foci = fociOf(view).filter((f) => f.node !== node)
+        view.focusShow = (view.focusShow ?? []).filter(
+          (id) => !reach.nodes.has(id) && !reach.edges.has(id),
+        )
       })
+      set({ status: `focus removed: ${node}` })
     },
 
     clearFocus: () => {
       const v = get().view()
-      if (!v?.focus) return
+      if (!v || !fociOf(v).length) return
       set({
         stashedFocus: {
-          focus: { ...v.focus },
+          foci: fociOf(v).map((f) => ({ ...f })),
           show: [...(v.focusShow ?? [])],
           hide: [...(v.focusHide ?? [])],
         },
+        animateNext: true,
       })
-      get().setFocus(null, 0)
+      mut((_g, view) => {
+        view.foci = []
+        view.focusShow = []
+        view.focusHide = []
+      })
     },
 
     restoreFocus: () => {
@@ -562,7 +703,7 @@ export const useStore = create<KgeState>((set, get) => {
       if (!stash) return
       set({ animateNext: true, stashedFocus: null })
       mut((_g, v) => {
-        v.focus = { ...stash.focus }
+        v.foci = stash.foci.map((f) => ({ ...f }))
         v.focusShow = [...stash.show]
         v.focusHide = [...stash.hide]
       })
@@ -605,6 +746,9 @@ export const useStore = create<KgeState>((set, get) => {
       if (members.length < 2) return set({ status: 'a skewer needs at least 2 members' })
       mut((graph, v) => {
         ensureSkewerTypes(graph)
+        // One skewer per node: the new rail takes its members off any other.
+        const memberSet = new Set(members)
+        graph.edges = graph.edges.filter((e) => !(e.type === SKEWER_EDGE && memberSet.has(e.to)))
         graph.nodes.push({ id, type: SKEWER_TYPE, label: '', data: {} })
         members.forEach((m, i) => {
           graph.edges.push({ type: SKEWER_EDGE, from: id, to: m, data: { index: i } })
