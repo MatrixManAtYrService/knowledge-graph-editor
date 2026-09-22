@@ -238,35 +238,47 @@ arrays (`#g=xz-backdoor&v=default&p=n4&f=4.2` = primary-select node 4,
 focus on it at 2 hops), so links are stable only until the graph is edited
 and re-exported — dangling links after a data push are the accepted cost.
 
-The site also loads data lazily, in one of two layouts the exporter picks
-per graph:
-
-- **Inline** (at most `--inline-threshold` nodes, default 500,
-  `$KGE_INLINE_THRESHOLD`): `graph.json` carries every node and edge with
-  only the *lite* data fields rendering needs (the schema's `colorKey`,
-  skewer `orderKey`s); the rest of each item's `data` sits in JSON shards
-  fetched when it is inspected. One fetch shows everything; no wasm.
-- **Windowed** (bigger graphs): nodes and edges live in parquet files that
-  the browser queries with DuckDB-Wasm over HTTP range requests — the
-  ebb_profile_viz pattern. A deep link downloads roughly what it shows: the
-  saved view's focus resolves by BFS over a per-node adjacency column
-  (whole 1024-row groups fetched as cacheable shards), an id→row sidecar
-  makes by-name lookups prunable point reads, and visible edges are
-  synthesized from the adjacency entries without touching the edge table at
-  all. A 200k-node graph opens on a focused view for well under a megabyte
-  of parquet traffic (plus the one-time ~6 MB DuckDB-Wasm CDN download —
-  the wasm engine loads only in windowed mode, from jsDelivr, pinned). The
-  sidebar shows `loaded/total` counts per type, the color legend comes from
-  export-time aggregates, and a view that would exceed 4000 loaded nodes is
-  capped with a status hint to focus or filter instead. Two caveats: the
-  host must support HTTP Range requests (GitHub Pages does), and the skewer
-  subgraph plus all rail members always load whole — rails are presentation
-  for curated timelines, so keep them small relative to a huge graph.
+The site also loads data lazily — one layout for every graph, whatever its
+size: nodes and edges ship as parquet files that the browser queries with
+DuckDB-Wasm over HTTP range requests (the ebb_profile_viz pattern), so a
+deep link downloads roughly what it shows. `graph.json` keeps only what
+must be whole — schema, views, per-type and per-color-value counts (the
+sidebar's totals), and the skewer subgraph. The saved view's focus resolves
+by BFS over a per-node adjacency column (whole 1024-row groups fetched as
+cacheable shards), an id→row sidecar makes by-name lookups prunable point
+reads, visible edges are synthesized from the adjacency entries without
+touching the edge table, and an item's full `data` is point-read when it is
+inspected. A 200k-node graph opens on a focused view for well under a
+megabyte of parquet traffic (plus the one-time ~6 MB DuckDB-Wasm engine,
+loaded from jsDelivr, pinned). The sidebar shows `loaded/total` counts per
+type, and a view that would exceed 4000 loaded nodes is capped with a
+status hint to focus or filter instead. Two caveats: the host must support
+HTTP Range requests (GitHub Pages does; `python -m http.server` does not —
+check an export locally with `kge serve --readonly --dir <dir>` instead,
+which serves exactly what visitors will get), and the skewer
+subgraph plus all rail members always load whole — rails are presentation
+for curated timelines, so keep them small relative to a huge graph. For a
+60-node demo graph the wasm engine is overkill, but one code path beats
+two.
 
 `kge serve --site-dir <dir>` (or `$KGE_SITE_DIR`) keeps an export current:
 the data files are regenerated after every save, so committing the site
 directory alongside the graph puts the shareable copy in the same push (the
 demo repo publishes its `docs/` this way).
+
+The export doubles as a queryable database: `kge sql` runs DuckDB over the
+parquet files, registering each graph as `<graph>_nodes` / `_edges` /
+`_ids` with bare `nodes`/`edges`/`ids` aliases for the default (or
+`--graph`-picked) one:
+
+```bash
+kge sql "SELECT id, key FROM ids WHERE id LIKE 'peak:%'"   # share-URL ints
+kge sql -g xz-backdoor -f json "SELECT type, count(*) FROM nodes GROUP BY 1"
+```
+
+Ad-hoc structure questions, integer lookups, sweeps over `data` — that's
+its lane; `kge views <id>` remains the authority on what a saved view
+shows (focus and eye resolution live there, not in SQL).
 
 ## Selection is shared
 

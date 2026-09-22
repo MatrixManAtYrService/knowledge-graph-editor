@@ -138,6 +138,19 @@ def serve(
             "regenerated on every save, ready for GitHub Pages",
         ),
     ] = None,
+    readonly: Annotated[
+        bool,
+        typer.Option(
+            "--readonly",
+            help="Serve an exported static site from --dir instead of the live "
+            "editor: no API, no saving — just the files, with the HTTP Range "
+            "support DuckDB-Wasm needs (python -m http.server lacks it)",
+        ),
+    ] = False,
+    dir: Annotated[
+        Path | None,
+        typer.Option("--dir", help="The exported site --readonly serves (default ./docs)"),
+    ] = None,
     port: Annotated[int, typer.Option("--port", help="Server port")] = 8151,
 ) -> None:
     """Run the kge server over one or more graph directories.
@@ -145,11 +158,31 @@ def serve(
     With no options: serves the subdirectories of ./graphs if that exists,
     else ./graph (seeding an empty-but-valid graph there if missing, so a
     fresh consumer repo can start with just `kge serve`).
+
+    With --readonly: serves an exported site (kge export) from --dir —
+    what visitors will get from GitHub Pages, exactly.
     """
     import uvicorn
 
     from kge.server import create_app
     from kge.store import GraphRegistry, GraphStore
+
+    if readonly:
+        site = dir if dir is not None else Path("docs")
+        if not (site / "index.html").is_file():
+            raise _fail(f"{site} has no index.html — export first: kge export --out {site}")
+        from starlette.applications import Starlette
+
+        from fastapi.staticfiles import StaticFiles
+
+        static_app = Starlette()
+        static_app.mount("/", StaticFiles(directory=site, html=True), name="site")
+        console.print(f"read-only site: {site.resolve()}")
+        console.print(f"open http://localhost:{port}")
+        uvicorn.run(static_app, host="0.0.0.0", port=port, log_level="warning")
+        return
+    if dir is not None:
+        raise _fail("--dir only applies with --readonly (the editor takes --graph-dir/--graphs-dir)")
 
     if graph_dir is None and graphs_dir is None:
         if Path("graphs").is_dir():
@@ -201,25 +234,15 @@ def export(
         typer.Option("--ui-dir", help="Built UI to bundle (default: ./ui/dist, else the UI vendored in the package)"),
     ] = None,
     out: Annotated[Path, typer.Option("--out", "-o", help="Site output directory")] = Path("site"),
-    inline_threshold: Annotated[
-        int | None,
-        typer.Option(
-            "--inline-threshold",
-            help="Graphs with at most this many nodes ship as inline JSON (one "
-            "fetch, no wasm); bigger ones become DuckDB-Wasm-queried parquet "
-            "so viewers download only the sliver a view shows "
-            "($KGE_INLINE_THRESHOLD; default 500; 0 = always parquet)",
-        ),
-    ] = None,
 ) -> None:
-    """Write a static, read-only copy of the graphs — host it anywhere.
+    """Write a static, read-only copy of the graphs — host it anywhere with
+    HTTP Range support (GitHub Pages qualifies).
 
     Reads the graph files directly (no server needed). The output is the
     same browser UI in read-only mode: no saving, but focus, selection, and
     show/hide still work, and the state a visitor navigates to lives in the
-    URL fragment — share the link, share the view. Data loads lazily: small
-    graphs are one JSON fetch plus detail shards on inspect; large graphs
-    are parquet files queried in the browser via DuckDB-Wasm over HTTP range
+    URL fragment — share the link, share the view. The graphs ship as
+    parquet files queried in the browser via DuckDB-Wasm over HTTP range
     requests, so even a huge graph costs a viewer only the focused sliver
     their view shows.
 
@@ -244,9 +267,109 @@ def export(
         ui_dir = local if (local / "index.html").is_file() else _packaged_ui()
     if ui_dir is None:
         raise _fail("no built UI found (build ui/dist or install kge from a wheel/git)")
-    summary = export_site(registry, out, ui_dir, inline_threshold)
+    summary = export_site(registry, out, ui_dir)
     console.print(f"exported {summary['graphs']} graph(s) to {out.resolve()}")
-    console.print("[dim]serve it with any static host — e.g. GitHub Pages, or: python -m http.server[/dim]")
+    console.print(
+        "[dim]host it anywhere with HTTP Range support (GitHub Pages qualifies; "
+        f"python -m http.server does not) — check it locally: kge serve --readonly --dir {out}[/dim]"
+    )
+
+
+@app.command()
+def sql(
+    query_text: Annotated[
+        str,
+        typer.Argument(
+            metavar="QUERY",
+            help="DuckDB SQL over the exported parquet tables ('-' reads stdin)",
+        ),
+    ],
+    dir: Annotated[
+        Path,
+        typer.Option("--dir", help="Exported site directory (what kge export --out wrote)"),
+    ] = Path("docs"),
+    graph: Annotated[
+        str,
+        typer.Option(
+            "--graph",
+            "-g",
+            help="Graph whose tables get the bare names nodes/edges/ids "
+            "(default: the export's default graph)",
+        ),
+    ] = "",
+    fmt: Annotated[str, typer.Option("--format", "-f", help="table | json | csv")] = "table",
+) -> None:
+    """Query an exported site's parquet data with DuckDB.
+
+    Every graph's tables are registered as <graph>_nodes, <graph>_edges,
+    <graph>_ids (non-word characters become underscores); the default graph
+    — or the one picked with --graph — also gets the bare names nodes,
+    edges, ids. Columns:
+
+      nodes: key (the share-URL integer), id, type, label, lite (JSON),
+             data (full JSON; NULL when lite covers it), adj (JSON
+             adjacency: [edgeKey, otherKey, edgeType, otherType, outgoing])
+      edges: key, type, src, dst, src_key, dst_key, lite, data
+      ids:   id -> key, sorted by id
+
+    For "exactly what does saved view X show", use `kge views X` — focus
+    and eye resolution live there. sql is for everything else: ad-hoc
+    structure questions, integer lookups for share URLs, sweeps over data.
+    """
+    import re as _re
+
+    import duckdb
+
+    data_dir = dir / "data"
+    graphs_meta = data_dir / "graphs.json"
+    if not graphs_meta.is_file():
+        raise _fail(f"{dir} is not an exported site (no data/graphs.json) — run: kge export --out {dir}")
+    entries = json.loads(graphs_meta.read_text()).get("graphs", [])
+    if not entries:
+        raise _fail("the export contains no graphs")
+    if graph and not any(g["id"] == graph for g in entries):
+        raise _fail(
+            f"no such graph in the export: {graph} (available: {', '.join(g['id'] for g in entries)})"
+        )
+    bare_gid = graph or next((g["id"] for g in entries if g.get("default")), entries[0]["id"])
+
+    conn = duckdb.connect()
+    tables = ("nodes", "edges", "ids")
+
+    def register(view: str, gid: str, table: str) -> None:
+        f = data_dir / gid / f"{table}.parquet"
+        if f.is_file():
+            path = str(f).replace("'", "''")
+            conn.execute(f'CREATE OR REPLACE VIEW "{view}" AS SELECT * FROM read_parquet(\'{path}\')')
+
+    for entry in entries:
+        prefix = _re.sub(r"\W", "_", entry["id"])
+        for t in tables:
+            register(f"{prefix}_{t}", entry["id"], t)
+    for t in tables:
+        register(t, bare_gid, t)  # bare names last, so they win any collision
+
+    q = sys.stdin.read() if query_text.strip() == "-" else query_text
+    try:
+        rel = conn.sql(q)
+    except duckdb.Error as exc:
+        raise _fail(str(exc))
+    if rel is None:
+        return  # a statement with no result set
+    if fmt == "table":
+        rel.show()
+    elif fmt == "json":
+        cols = [d[0] for d in rel.description]
+        print(json.dumps([dict(zip(cols, row)) for row in rel.fetchall()], indent=2, default=str))
+    elif fmt == "csv":
+        import csv
+
+        cols = [d[0] for d in rel.description]
+        writer = csv.writer(sys.stdout)
+        writer.writerow(cols)
+        writer.writerows(rel.fetchall())
+    else:
+        raise _fail("--format must be table, json, or csv")
 
 
 @app.command()
@@ -282,6 +405,10 @@ repo serves several, graph/ when it serves one)
                            (transient, last-writer-wins; `kge selection`)
   browser memory only      the human's UNSAVED edit buffer
   this CLI                 nothing — every command is stateless
+  docs/ (if exported)      a static read-only mirror of the graphs as
+                           parquet — regenerated on every save when the
+                           server runs with --site-dir/$KGE_SITE_DIR, and
+                           queryable with `kge sql` (see below)
 
 [bold]The editing model — clobber, never merge[/bold]
 
@@ -336,10 +463,37 @@ repo serves several, graph/ when it serves one)
     without being logically connected to (uses the view's saved geometry —
     ask them to Save first if they've been dragging).
 
+[bold]Exploring with SQL — usually your cheapest read[/bold]
+
+  `kge sql "QUERY"` runs DuckDB over the exported parquet (default
+  --dir docs; export first with `kge export --out docs` if it's missing).
+  For anything beyond a single node — counts, filters, joins, neighborhood
+  questions — this beats dumping the graph and grepping, and it costs the
+  context of one result set instead of the whole payload:
+
+    kge sql "SELECT type, count(*) FROM nodes GROUP BY 1"
+    kge sql "SELECT id, label FROM nodes WHERE lite->>'actor' = 'Jia Tan'"
+    kge sql "SELECT src, dst FROM edges WHERE type = 'MERGED_AS'"
+    kge sql -g other-graph -f json "SELECT ... "   # pick graph; json/csv out
+
+  Tables per graph: <graph>_nodes/_edges/_ids, with bare nodes/edges/ids
+  aliased to the default (or -g) graph. Columns to know: nodes.key is the
+  integer share-URLs use; nodes.lite (JSON) always carries the hot fields
+  (the schema's colorKey, skewer orderKeys) — filter on lite, not data,
+  for those; nodes.data is the full payload and NULL when lite already
+  holds everything (COALESCE(data, lite) reads both); nodes.adj is the
+  adjacency list \\[edgeKey, otherKey, edgeType, otherType, outgoing] —
+  one-hop questions without touching the edge table.
+
+  Two boundaries: the export is a MIRROR — after editing, re-export (or run
+  the server with --site-dir so saves do it) before trusting `kge sql`; and
+  "what does saved view X show" belongs to `kge views X`, which applies the
+  focus/eye resolution SQL doesn't know about.
+
 [bold]Reading and editing[/bold]
 
   read:  status · graphs · ls · show · types · views · selection ·
-         find-collisions · dump
+         find-collisions · dump · sql
   edit:  add-graph · add-node · rm-node · add-edge · rm-edge · add-type ·
          skewer · load
 

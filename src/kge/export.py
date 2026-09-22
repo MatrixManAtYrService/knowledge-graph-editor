@@ -6,19 +6,16 @@ file host can serve:
     <site>/index.html + assets/   the same built UI, with a marker script
                                   injected so it boots in read-only mode
     <site>/data/graphs.json       what GET /api/graphs returns
-    <site>/data/<id>/graph.json   schema + views + either the inline graph
-                                  (small) or aggregate counts (windowed)
-    ...and per graph, one of two data layouts:
+    <site>/data/<id>/graph.json   schema, views, and aggregate counts
+    <site>/data/<id>/{nodes,edges,ids}.parquet   the graph itself
 
-Inline mode (graphs of <= inline_threshold nodes, default 500): graph.json
-carries every node/edge with *lite* data, plus JSON detail shards
-({node,edge}-data-<k>.json) fetched when an item is inspected. One fetch
-shows everything; no wasm involved.
-
-Windowed mode (bigger graphs): nodes.parquet / edges.parquet, sorted by
-(type, id) with tight row groups (ebb_profile_viz's pattern), which the
-browser queries through DuckDB-Wasm over HTTP range requests — so a view
-showing a focused sliver of a huge graph downloads roughly that sliver:
+One layout for every graph, whatever its size: parquet sorted by (type, id)
+with tight row groups (ebb_profile_viz's pattern), which the browser
+queries through DuckDB-Wasm over HTTP range requests — so a view showing a
+focused sliver of a huge graph downloads roughly that sliver. (For a tiny
+graph the wasm engine is overkill, but one code path beats two.) The host
+must support HTTP Range requests — GitHub Pages does; python -m
+http.server does not:
 
   - `key` (INT32, the row's index) doubles as the share-URL integer; row
     groups span tight key ranges, so `WHERE key IN (...)` reads only the
@@ -44,7 +41,6 @@ across data pushes, the accepted cost of not maintaining an id registry.
 from __future__ import annotations
 
 import json
-import math
 import os
 import shutil
 from pathlib import Path
@@ -55,9 +51,7 @@ import pyarrow.parquet as pq
 from kge.models import Graph
 from kge.store import GraphRegistry
 
-INLINE_THRESHOLD = 500  # <= this many nodes: inline JSON, no wasm
-SHARD_SIZE = 64  # JSON detail shards (inline mode)
-# Parquet row-group size (windowed mode): the browser's fetch unit. Bigger
+# Parquet row-group size: the browser's fetch unit. Bigger
 # groups mean fewer, larger range reads and — just as important — a smaller
 # footer: row-group metadata is read up front, and at 200k rows it already
 # runs to hundreds of KB.
@@ -111,10 +105,8 @@ def _write_parquet(
     os.replace(tmp, path)
 
 
-def export_graph_data(graph: Graph, out_dir: Path, inline_threshold: int | None = None) -> dict:
+def export_graph_data(graph: Graph, out_dir: Path) -> dict:
     """Write one graph's static data files. Returns a summary dict."""
-    if inline_threshold is None:
-        inline_threshold = int(os.environ.get("KGE_INLINE_THRESHOLD", INLINE_THRESHOLD))
     out_dir.mkdir(parents=True, exist_ok=True)
     # The export order defines each item's integer: nodes by (type, id) so a
     # type is one contiguous key range, edges by (type, from, to).
@@ -142,53 +134,15 @@ def export_graph_data(graph: Graph, out_dir: Path, inline_threshold: int | None 
         "schema": graph.graph_schema.model_dump(),
         "views": [v.model_dump(by_alias=True) for v in graph.views],
     }
-    inline = len(graph.nodes) <= inline_threshold
-    if inline:
-        base["nodes"] = nodes_lite
-        base["edges"] = edges_lite
-        base["detail"] = _write_shards(out_dir, node_detail, edge_detail, len(graph.nodes), len(graph.edges))
-        for f in ("nodes.parquet", "edges.parquet"):
-            (out_dir / f).unlink(missing_ok=True)
-    else:
-        base["store"] = _write_windowed(graph, out_dir, nodes_lite, edges_lite, node_detail, edge_detail)
-        for f in out_dir.glob("node-data-*.json"):
-            f.unlink()
-        for f in out_dir.glob("edge-data-*.json"):
-            f.unlink()
-    if inline:
-        (out_dir / "ids.parquet").unlink(missing_ok=True)
+    base["store"] = _write_windowed(graph, out_dir, nodes_lite, edges_lite, node_detail, edge_detail)
+    # Prune the shard files of the retired inline layout.
+    for f in out_dir.glob("node-data-*.json"):
+        f.unlink()
+    for f in out_dir.glob("edge-data-*.json"):
+        f.unlink()
     _write_json(out_dir / "graph.json", base)
-    return {"nodes": len(graph.nodes), "edges": len(graph.edges), "inline": inline}
+    return {"nodes": len(graph.nodes), "edges": len(graph.edges)}
 
-
-def _write_shards(
-    out_dir: Path,
-    node_detail: dict[int, dict],
-    edge_detail: dict[int, dict],
-    n_nodes: int,
-    n_edges: int,
-) -> dict:
-    """Inline mode's lazy layer: JSON detail shards keyed by item integer."""
-
-    def write(prefix: str, detail: dict[int, dict], total: int) -> list[int]:
-        present: list[int] = []
-        for k in range(math.ceil(total / SHARD_SIZE) if total else 0):
-            entries = {
-                str(i): d for i, d in detail.items() if k * SHARD_SIZE <= i < (k + 1) * SHARD_SIZE
-            }
-            path = out_dir / f"{prefix}-{k}.json"
-            if entries:
-                present.append(k)
-                _write_json(path, entries)
-            elif path.is_file():
-                path.unlink()
-        return present
-
-    return {
-        "shardSize": SHARD_SIZE,
-        "nodeShards": write("node-data", node_detail, n_nodes),
-        "edgeShards": write("edge-data", edge_detail, n_edges),
-    }
 
 
 def _write_windowed(
@@ -330,9 +284,7 @@ def _write_windowed(
     }
 
 
-def export_data(
-    registry: GraphRegistry, site_dir: Path, inline_threshold: int | None = None
-) -> dict:
+def export_data(registry: GraphRegistry, site_dir: Path) -> dict:
     """Write graphs.json + every graph's data files; prune deleted graphs."""
     data_dir = site_dir / "data"
     stores = registry.stores()
@@ -348,7 +300,7 @@ def export_data(
                 "default": gid == registry.default_id(),
             }
         )
-        export_graph_data(g, data_dir / gid, inline_threshold)
+        export_graph_data(g, data_dir / gid)
     _write_json(data_dir / "graphs.json", {"graphs": graphs})
     if data_dir.is_dir():
         for d in data_dir.iterdir():
@@ -376,12 +328,7 @@ def export_assets(ui_dir: Path, site_dir: Path) -> None:
     (site_dir / ".nojekyll").write_text("")
 
 
-def export_site(
-    registry: GraphRegistry,
-    site_dir: Path,
-    ui_dir: Path | None,
-    inline_threshold: int | None = None,
-) -> dict:
+def export_site(registry: GraphRegistry, site_dir: Path, ui_dir: Path | None) -> dict:
     if ui_dir is not None and (ui_dir / "index.html").is_file():
         export_assets(ui_dir, site_dir)
-    return export_data(registry, site_dir, inline_threshold)
+    return export_data(registry, site_dir)

@@ -335,7 +335,7 @@ async function resolveViewData(): Promise<void> {
       const sg = staticGraph()
       const st = useStore.getState()
       const g = st.graph
-      if (!sg || sg.mode !== 'parquet' || !g) return
+      if (!sg || !g) return
       const view = g.views.find((x) => x.id === st.viewId) ?? g.views[0]
       if (!view) return
       const finger = JSON.stringify([

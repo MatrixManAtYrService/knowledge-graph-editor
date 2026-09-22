@@ -3,23 +3,18 @@
 // kge server. The exported index.html sets window.KGE_STATIC before the app
 // module loads — that global is the whole mode switch.
 //
-// Two data layouts, chosen per graph by the exporter:
+// One data layout for every graph, whatever its size: graph.json carries
+// only schema, views, aggregate counts, and the skewer subgraph; nodes and
+// edges live in parquet files that DuckDB-Wasm queries over HTTP range
+// requests (duck.ts). The store holds just the *loaded* subset, and
+// ensureViewLoaded keeps the invariant the rest of the app relies on:
+// loaded ⊇ whatever the view shows. Focus BFS hops on the per-node `adj`
+// column (point reads by key); no-focus views load whole included types (a
+// contiguous range in the (type, id)-sorted file); everything else the
+// view names by id is point-read via the sorted ids sidecar.
 //
-// Inline (small graphs): graph.json carries every node and edge with *lite*
-// data; the full `data` of item N lives in JSON shards fetched when the
-// item is inspected. One fetch shows everything; no wasm.
-//
-// Windowed (big graphs): graph.json carries only schema, views, aggregate
-// counts, and the skewer subgraph; nodes/edges live in parquet files that
-// DuckDB-Wasm queries over HTTP range requests (duck.ts). The store then
-// holds just the *loaded* subset, and ensureViewLoaded keeps the invariant
-// the rest of the app relies on: loaded ⊇ whatever the view shows. Focus
-// BFS hops on the per-node `adj` column (point reads by key); no-focus
-// views load whole included types (a contiguous range in the (type, id)-
-// sorted file); everything else the view names by id is point-read.
-//
-// In both modes every node/edge has an integer — its row/array index — used
-// by the share URLs (share.ts) and the lazy detail lookups.
+// Every node/edge has an integer — its parquet row index — used by the
+// share URLs (share.ts) and the lazy detail lookups.
 
 import { query, registerParquet, sqlStr } from './duck'
 import { SKEWER_EDGE, SKEWER_TYPE } from './graph'
@@ -34,12 +29,6 @@ declare global {
 
 export const STATIC_MODE: boolean =
   typeof window !== 'undefined' && window.KGE_STATIC === true
-
-interface DetailMeta {
-  shardSize: number
-  nodeShards: number[] // shard files that actually exist (empty ones are not written)
-  edgeShards: number[]
-}
 
 interface StoreBlock {
   mode: 'parquet'
@@ -68,24 +57,14 @@ export interface StaticTotals {
 /** Everything static mode knows about the currently loaded graph. */
 export interface StaticGraph {
   graphId: string
-  mode: 'inline' | 'parquet'
   payload: GraphPayload // the live object the store holds (shared arrays)
   pristine: GraphPayload // deep copy of the saved state, for URL diffing
-  totals: StaticTotals | null // windowed mode: what exists vs what's loaded
+  totals: StaticTotals // what exists in the data vs what's loaded
   nodeIdOf(i: number): string | undefined
   nodeTypeOf(i: number): string | undefined
   edgeKeyOf(i: number): string | undefined
   intOfNode(id: string): number | undefined
   intOfEdge(key: string): number | undefined
-}
-
-interface InlineState {
-  meta: DetailMeta
-  fetched: { node: Set<number>; edge: Set<number> }
-  nodeIds: string[]
-  edgeKeys: string[]
-  nodeInt: Map<string, number>
-  edgeInt: Map<string, number>
 }
 
 interface WindowedState {
@@ -104,7 +83,7 @@ interface WindowedState {
   detail: { node: Set<number>; edge: Set<number> } // full-data fetches done
 }
 
-let current: (StaticGraph & { inline?: InlineState; windowed?: WindowedState }) | null = null
+let current: (StaticGraph & { windowed: WindowedState }) | null = null
 export const staticGraph = (): StaticGraph | null => current
 
 async function getJson(url: string): Promise<unknown> {
@@ -122,45 +101,11 @@ export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
   const raw = (await getJson(`data/${encodeURIComponent(graphId)}/graph.json`)) as {
     schema: GraphPayload['schema']
     views: View[]
-    nodes?: NodeT[]
-    edges?: EdgeT[]
-    detail?: DetailMeta
     store?: StoreBlock
   }
-  if (raw.nodes && raw.edges) {
-    const payload: GraphPayload = {
-      schema: raw.schema,
-      nodes: raw.nodes,
-      edges: raw.edges,
-      views: raw.views,
-    }
-    const inline: InlineState = {
-      meta: raw.detail ?? { shardSize: 64, nodeShards: [], edgeShards: [] },
-      fetched: { node: new Set(), edge: new Set() },
-      nodeIds: payload.nodes.map((n) => n.id),
-      edgeKeys: payload.edges.map(edgeKey),
-      nodeInt: new Map(payload.nodes.map((n, i) => [n.id, i])),
-      edgeInt: new Map(payload.edges.map((e, i) => [edgeKey(e), i])),
-    }
-    current = {
-      graphId,
-      mode: 'inline',
-      payload,
-      pristine: structuredClone(payload),
-      totals: null,
-      inline,
-      nodeIdOf: (i) => inline.nodeIds[i],
-      nodeTypeOf: (i) => payload.nodes[i]?.type,
-      edgeKeyOf: (i) => inline.edgeKeys[i],
-      intOfNode: (id) => inline.nodeInt.get(id),
-      intOfEdge: (key) => inline.edgeInt.get(key),
-    }
-    return payload
-  }
-
   const block = raw.store
   if (!block || block.mode !== 'parquet') {
-    throw new Error(`graph ${graphId}: unrecognized static data layout`)
+    throw new Error(`graph ${graphId}: unrecognized static data layout (re-run kge export)`)
   }
   const payload: GraphPayload = { schema: raw.schema, nodes: [], edges: [], views: raw.views }
   const w: WindowedState = {
@@ -197,7 +142,6 @@ export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
   }
   current = {
     graphId,
-    mode: 'parquet',
     payload,
     pristine: structuredClone(payload),
     totals: {
@@ -392,7 +336,7 @@ async function ensureEdgesByKeyStrings(keys: string[]): Promise<number> {
 /** Point-load nodes/edges referenced by share-URL integers (share.ts calls
  * this before decoding a hash, so links into unloaded territory resolve). */
 export async function ensureInts(nodeInts: number[], edgeInts: number[]): Promise<void> {
-  if (current?.mode !== 'parquet') return
+  if (!current) return
   const added = (await ensureNodesByInts(nodeInts)) + (await ensureEdgesByInts(edgeInts))
   if (added) publishLoaded()
 }
@@ -529,52 +473,27 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
 
 // -- lazy full data ------------------------------------------------------------
 
-/** Pull one item's full `data` payload and merge it into the live graph.
- * Inline mode fetches the covering JSON shard; windowed mode point-reads
- * the parquet `data` column. Returns true when data changed. */
+/** Pull one item's full `data` payload — a point read of the parquet `data`
+ * column — and merge it into the live graph. Returns true when data changed. */
 export async function hydrateDetails(sel: Sel): Promise<boolean> {
   if (!current) return false
   const kind = sel.kind === 'edge' ? 'edge' : 'node'
-  if (current.mode === 'parquet') {
-    const w = current.windowed!
-    const int = kind === 'node' ? w.nodeIntById.get(sel.id) : w.edgeIntByKey.get(sel.id)
-    if (int === undefined || w.detail[kind].has(int)) return false
-    w.detail[kind].add(int)
-    try {
-      const file = kind === 'node' ? w.files.nodes : w.files.edges
-      await registerParquet(file)
-      const rows = await query(`SELECT data FROM '${file}' WHERE key = ${int}`)
-      const raw = rows[0]?.data
-      if (typeof raw !== 'string' || !raw) return false // lite already covers it
-      const target = kind === 'node' ? w.loadedNodes.get(int) : w.loadedEdges.get(int)
-      if (!target) return false
-      target.data = parseJson(raw)
-      return true
-    } catch {
-      w.detail[kind].delete(int) // transient failure: allow a retry
-      return false
-    }
-  }
-
-  const inline = current.inline!
-  const int = (kind === 'node' ? inline.nodeInt : inline.edgeInt).get(sel.id)
-  if (int === undefined) return false
-  const shard = Math.floor(int / inline.meta.shardSize)
-  const present = kind === 'node' ? inline.meta.nodeShards : inline.meta.edgeShards
-  if (inline.fetched[kind].has(shard) || !present.includes(shard)) return false
-  inline.fetched[kind].add(shard)
+  const w = current.windowed
+  const int = kind === 'node' ? w.nodeIntById.get(sel.id) : w.edgeIntByKey.get(sel.id)
+  if (int === undefined || w.detail[kind].has(int)) return false
+  w.detail[kind].add(int)
   try {
-    const entries = (await getJson(
-      `data/${encodeURIComponent(current.graphId)}/${kind}-data-${shard}.json`,
-    )) as Record<string, Record<string, unknown>>
-    for (const [k, data] of Object.entries(entries)) {
-      const target =
-        kind === 'node' ? current.payload.nodes[Number(k)] : current.payload.edges[Number(k)]
-      if (target) target.data = data
-    }
+    const file = kind === 'node' ? w.files.nodes : w.files.edges
+    await registerParquet(file)
+    const rows = await query(`SELECT data FROM '${file}' WHERE key = ${int}`)
+    const raw = rows[0]?.data
+    if (typeof raw !== 'string' || !raw) return false // lite already covers it
+    const target = kind === 'node' ? w.loadedNodes.get(int) : w.loadedEdges.get(int)
+    if (!target) return false
+    target.data = parseJson(raw)
     return true
   } catch {
-    inline.fetched[kind].delete(shard)
+    w.detail[kind].delete(int) // transient failure: allow a retry
     return false
   }
 }
