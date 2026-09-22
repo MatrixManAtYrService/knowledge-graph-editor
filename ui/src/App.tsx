@@ -2,15 +2,20 @@ import { useEffect } from 'react'
 import { GraphCanvas } from './GraphCanvas'
 import { Inspector } from './Inspector'
 import { Sidebar } from './Sidebar'
-import { Toolbar } from './Toolbar'
+import { initShare } from './share'
+import { STATIC_MODE } from './static'
 import { useStore } from './store'
+import { Toolbar } from './Toolbar'
 
 export function App() {
   const status = useStore((s) => s.status)
   const refresh = useStore((s) => s.refresh)
 
   useEffect(() => {
-    void refresh()
+    // Static site: boot from the URL hash and keep it mirrored (share.ts);
+    // editor: just load from the server.
+    if (STATIC_MODE) void initShare()
+    else void refresh()
   }, [refresh])
 
   return (

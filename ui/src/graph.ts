@@ -353,6 +353,13 @@ export function boundValue(
   return typeof raw === 'string' || typeof raw === 'number' ? String(raw) : null
 }
 
+/** The color a bound value wears: pinned by the schema, else a stable
+ * palette pick (computable from the value alone — the static site's legend
+ * uses this for values whose nodes aren't loaded). */
+export function valueColor(schema: GraphSchema, value: string): string {
+  return schema.colorValues?.[value] ?? BIND_PALETTE[strHash(value) % BIND_PALETTE.length]
+}
+
 /** A node's display color: the bound value's color when the schema binds one
  * and the node carries the field, else the type color passed as fallback. */
 export function nodeColor(
@@ -362,7 +369,7 @@ export function nodeColor(
 ): string {
   const value = boundValue(schema, node)
   if (value === null) return fallback
-  return schema.colorValues?.[value] ?? BIND_PALETTE[strHash(value) % BIND_PALETTE.length]
+  return valueColor(schema, value)
 }
 
 /** The view's focus centers (defensive: payloads always arrive with `foci`

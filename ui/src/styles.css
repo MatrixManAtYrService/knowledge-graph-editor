@@ -502,6 +502,39 @@ button.mini.toggled-on {
   font-size: 11px;
 }
 
+.ro-badge {
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.ro-field {
+  font-size: 12px;
+}
+
+.ro-key {
+  color: #888;
+  margin-right: 6px;
+}
+
+.ro-data {
+  margin: 0;
+  padding: 6px;
+  background: #f6f7f8;
+  border: 1px solid #e3e5e8;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 40vh;
+  overflow: auto;
+}
+
 .slot {
   display: flex;
   flex-direction: column;

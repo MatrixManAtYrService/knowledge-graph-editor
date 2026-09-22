@@ -220,6 +220,54 @@ between the rails they connect (least-bad wins when zero crossings is
 impossible). Nodes with no edge into the bundle are kept out of the band
 entirely. A pinned rail anchors the whole grid.
 
+## Read-only static export
+
+`kge export` writes a self-contained static site (default `./site`) that any
+file host — GitHub Pages included — can serve: the same browser UI booted in
+read-only mode over exported JSON files. Editing is gone (no save, no
+create/delete), but everything perspectival works — views, focus walks,
+selection, the sidebar's include/eye toggles, even the layout actions — and
+the state a visitor navigates to is mirrored into the URL fragment, so the
+address bar is always a shareable deep link. A colleague can start from a
+saved view, modify what's shown, and send you *that*. Layout changes (drags,
+spacing actions) are the one thing not encoded — too heavy for a URL; a
+shared link plays the saved layout with the sender's visibility on top.
+
+URLs reference nodes and edges by their integer position in the exported
+arrays (`#g=xz-backdoor&v=default&p=n4&f=4.2` = primary-select node 4,
+focus on it at 2 hops), so links are stable only until the graph is edited
+and re-exported — dangling links after a data push are the accepted cost.
+
+The site also loads data lazily, in one of two layouts the exporter picks
+per graph:
+
+- **Inline** (at most `--inline-threshold` nodes, default 500,
+  `$KGE_INLINE_THRESHOLD`): `graph.json` carries every node and edge with
+  only the *lite* data fields rendering needs (the schema's `colorKey`,
+  skewer `orderKey`s); the rest of each item's `data` sits in JSON shards
+  fetched when it is inspected. One fetch shows everything; no wasm.
+- **Windowed** (bigger graphs): nodes and edges live in parquet files that
+  the browser queries with DuckDB-Wasm over HTTP range requests — the
+  ebb_profile_viz pattern. A deep link downloads roughly what it shows: the
+  saved view's focus resolves by BFS over a per-node adjacency column
+  (whole 1024-row groups fetched as cacheable shards), an id→row sidecar
+  makes by-name lookups prunable point reads, and visible edges are
+  synthesized from the adjacency entries without touching the edge table at
+  all. A 200k-node graph opens on a focused view for well under a megabyte
+  of parquet traffic (plus the one-time ~6 MB DuckDB-Wasm CDN download —
+  the wasm engine loads only in windowed mode, from jsDelivr, pinned). The
+  sidebar shows `loaded/total` counts per type, the color legend comes from
+  export-time aggregates, and a view that would exceed 4000 loaded nodes is
+  capped with a status hint to focus or filter instead. Two caveats: the
+  host must support HTTP Range requests (GitHub Pages does), and the skewer
+  subgraph plus all rail members always load whole — rails are presentation
+  for curated timelines, so keep them small relative to a huge graph.
+
+`kge serve --site-dir <dir>` (or `$KGE_SITE_DIR`) keeps an export current:
+the data files are regenerated after every save, so committing the site
+directory alongside the graph puts the shareable copy in the same push (the
+demo repo publishes its `docs/` this way).
+
 ## Selection is shared
 
 Every click publishes the two-slot selection (primary = latest click,

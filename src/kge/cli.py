@@ -130,6 +130,14 @@ def serve(
         Path | None,
         typer.Option("--ui-dir", help="Built UI to serve at / (default: ./ui/dist, else the UI vendored in the package)"),
     ] = None,
+    site_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--site-dir",
+            help="Also maintain a static read-only site here ($KGE_SITE_DIR): "
+            "regenerated on every save, ready for GitHub Pages",
+        ),
+    ] = None,
     port: Annotated[int, typer.Option("--port", help="Server port")] = 8151,
 ) -> None:
     """Run the kge server over one or more graph directories.
@@ -158,12 +166,87 @@ def serve(
     if ui_dir is None:
         local = Path("ui") / "dist"
         ui_dir = local if (local / "index.html").is_file() else _packaged_ui()
+    if site_dir is None and os.environ.get("KGE_SITE_DIR"):
+        site_dir = Path(os.environ["KGE_SITE_DIR"])
     for gid, store in stores.items():
         mark = "  (default)" if gid == registry.default_id() else ""
         console.print(f"graph {gid}: {store.dir}{mark}")
     console.print(f"ui: {ui_dir.resolve() if ui_dir else '(none found — API only)'}")
+    if site_dir is not None:
+        from kge.export import export_site
+
+        summary = export_site(registry, site_dir, ui_dir)
+        console.print(f"static site: {site_dir.resolve()} ({summary['graphs']} graph(s), re-exported on save)")
     console.print(f"open http://localhost:{port}")
-    uvicorn.run(create_app(registry, ui_dir), host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(
+        create_app(registry, ui_dir, site_dir=site_dir),
+        host="0.0.0.0",
+        port=port,
+        log_level="warning",
+    )
+
+
+@app.command()
+def export(
+    graph_dir: Annotated[
+        list[Path] | None,
+        typer.Option("--graph-dir", help="A graph directory to export (repeatable)"),
+    ] = None,
+    graphs_dir: Annotated[
+        Path | None,
+        typer.Option("--graphs-dir", help="A root whose subdirectories are graphs"),
+    ] = None,
+    ui_dir: Annotated[
+        Path | None,
+        typer.Option("--ui-dir", help="Built UI to bundle (default: ./ui/dist, else the UI vendored in the package)"),
+    ] = None,
+    out: Annotated[Path, typer.Option("--out", "-o", help="Site output directory")] = Path("site"),
+    inline_threshold: Annotated[
+        int | None,
+        typer.Option(
+            "--inline-threshold",
+            help="Graphs with at most this many nodes ship as inline JSON (one "
+            "fetch, no wasm); bigger ones become DuckDB-Wasm-queried parquet "
+            "so viewers download only the sliver a view shows "
+            "($KGE_INLINE_THRESHOLD; default 500; 0 = always parquet)",
+        ),
+    ] = None,
+) -> None:
+    """Write a static, read-only copy of the graphs — host it anywhere.
+
+    Reads the graph files directly (no server needed). The output is the
+    same browser UI in read-only mode: no saving, but focus, selection, and
+    show/hide still work, and the state a visitor navigates to lives in the
+    URL fragment — share the link, share the view. Data loads lazily: small
+    graphs are one JSON fetch plus detail shards on inspect; large graphs
+    are parquet files queried in the browser via DuckDB-Wasm over HTTP range
+    requests, so even a huge graph costs a viewer only the focused sliver
+    their view shows.
+
+    Graph dir resolution matches `kge serve`: --graph-dir/--graphs-dir, else
+    ./graphs, else ./graph.
+    """
+    from kge.export import export_site
+    from kge.store import GraphRegistry
+
+    if graph_dir is None and graphs_dir is None:
+        if Path("graphs").is_dir():
+            graphs_dir = Path("graphs")
+        elif Path("graph").is_dir():
+            graph_dir = [Path("graph")]
+        else:
+            raise _fail("no ./graphs or ./graph here — pass --graphs-dir or --graph-dir")
+    registry = GraphRegistry(dirs=graph_dir, root=graphs_dir)
+    if not registry.stores():
+        raise _fail("no graphs found to export")
+    if ui_dir is None:
+        local = Path("ui") / "dist"
+        ui_dir = local if (local / "index.html").is_file() else _packaged_ui()
+    if ui_dir is None:
+        raise _fail("no built UI found (build ui/dist or install kge from a wheel/git)")
+    summary = export_site(registry, out, ui_dir, inline_threshold)
+    console.print(f"exported {summary['graphs']} graph(s) to {out.resolve()}")
+    console.print("[dim]serve it with any static host — e.g. GitHub Pages, or: python -m http.server[/dim]")
 
 
 @app.command()

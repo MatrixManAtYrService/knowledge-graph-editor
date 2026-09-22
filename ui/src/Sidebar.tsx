@@ -16,9 +16,11 @@ import {
   SKEWER_TYPE,
   skewerShown,
   skewersOf,
+  valueColor,
   visibleSets,
   type Skewer,
 } from './graph'
+import { STATIC_MODE, staticGraph } from './static'
 import { useStore } from './store'
 import type { Sel, TypeDef, View } from './types'
 import { edgeKey } from './types'
@@ -157,11 +159,15 @@ function Tree({
   view,
   families,
   shownIds,
+  totals,
 }: {
   kind: 'node' | 'edge'
   view: View
   families: Map<string, TypeRow[]>
   shownIds: Set<string>
+  /** Windowed static mode: how many items of each type exist in the data
+   * (the rows below list only the loaded sliver). */
+  totals?: Record<string, number>
 }) {
   const {
     setTypesChecked,
@@ -336,7 +342,21 @@ function Tree({
                         <span className="dash" style={{ background: t.td.color || '#aaa' }} />
                       )}
                       <span className="tree-label" title={t.td.description}>
-                        {t.name} <span className="count">({t.items.length})</span>
+                        {t.name}{' '}
+                        <span
+                          className="count"
+                          title={
+                            totals && (totals[t.name] ?? 0) > t.items.length
+                              ? `${t.items.length} of ${totals[t.name]} loaded — the rest stays on the server until a focus or filter reaches it`
+                              : undefined
+                          }
+                        >
+                          (
+                          {totals && (totals[t.name] ?? 0) > t.items.length
+                            ? `${t.items.length}/${totals[t.name]}`
+                            : t.items.length}
+                          )
+                        </span>
                       </span>
                     </div>
                     {tOpen &&
@@ -377,7 +397,7 @@ function Tree({
                           >
                             {item.label}
                           </span>
-                          {item.skewers && item.skewers.length > 0 && (
+                          {!STATIC_MODE && item.skewers && item.skewers.length > 0 && (
                             <button
                               className="row-btn"
                               title={`unskewer: remove from ${item.skewers.join(', ')} (the node stays)`}
@@ -388,24 +408,26 @@ function Tree({
                               ⊘
                             </button>
                           )}
-                          <button
-                            className="row-btn"
-                            title={
-                              kind === 'node'
-                                ? item.sel.kind === 'skewer'
-                                  ? 'delete this skewer from the graph (its members stay)'
-                                  : 'delete this node and its edges from the graph'
-                                : 'delete this edge from the graph'
-                            }
-                            onClick={() =>
-                              deleteItems(
-                                kind === 'node' ? [item.id] : [],
-                                kind === 'edge' ? [item.id] : [],
-                              )
-                            }
-                          >
-                            ⊖
-                          </button>
+                          {!STATIC_MODE && (
+                            <button
+                              className="row-btn"
+                              title={
+                                kind === 'node'
+                                  ? item.sel.kind === 'skewer'
+                                    ? 'delete this skewer from the graph (its members stay)'
+                                    : 'delete this node and its edges from the graph'
+                                  : 'delete this edge from the graph'
+                              }
+                              onClick={() =>
+                                deleteItems(
+                                  kind === 'node' ? [item.id] : [],
+                                  kind === 'edge' ? [item.id] : [],
+                                )
+                              }
+                            >
+                              ⊖
+                            </button>
+                          )}
                         </div>
                       ))}
                   </div>
@@ -457,7 +479,7 @@ function SkewerTree({ view, shownIds }: { view: View; shownIds: Set<string> }) {
   const canNewSkewer =
     multiNodes.length >= 2 ||
     (primary?.kind === 'node' && secondary?.kind === 'node' && primary.id !== secondary.id)
-  const newSkewer = (
+  const newSkewer = STATIC_MODE ? null : (
     <div className="tree-tools">
       <button
         className="mini"
@@ -543,14 +565,16 @@ function SkewerTree({ view, shownIds }: { view: View; shownIds: Set<string> }) {
                         onChange={() => setEnabled([s], !skewerShown(view, s.id))}
                       />
                       <Eye state={shownIds.has(s.id) ? 'on' : 'off'} />
-                      <button
-                        className="row-btn row-btn-add"
-                        disabled={!canAdd}
-                        title={addTitle}
-                        onClick={() => addToSkewer(s.id, primary!.id)}
-                      >
-                        ⊕
-                      </button>
+                      {!STATIC_MODE && (
+                        <button
+                          className="row-btn row-btn-add"
+                          disabled={!canAdd}
+                          title={addTitle}
+                          onClick={() => addToSkewer(s.id, primary!.id)}
+                        >
+                          ⊕
+                        </button>
+                      )}
                       <Pin
                         pinned={view.layout.skewers[s.id]?.pinned ?? false}
                         onClick={() =>
@@ -645,13 +669,22 @@ function SkewerTree({ view, shownIds }: { view: View; shownIds: Set<string> }) {
 function ColorLegend() {
   const graph = useStore((s) => s.graph)!
   const values = new Map<string, { color: string; count: number }>()
-  for (const n of graph.nodes) {
-    if (n.type === SKEWER_TYPE) continue
-    const value = boundValue(graph.schema, n)
-    if (value === null) continue
-    const cur = values.get(value)
-    if (cur) cur.count++
-    else values.set(value, { color: nodeColor(graph.schema, n, '#888'), count: 1 })
+  const colorTotals = staticGraph()?.totals?.colors
+  if (colorTotals && Object.keys(colorTotals).length) {
+    // Windowed static mode: the legend covers the whole dataset, not just
+    // the loaded sliver — counts come from the export's aggregates.
+    for (const [value, count] of Object.entries(colorTotals)) {
+      values.set(value, { color: valueColor(graph.schema, value), count })
+    }
+  } else {
+    for (const n of graph.nodes) {
+      if (n.type === SKEWER_TYPE) continue
+      const value = boundValue(graph.schema, n)
+      if (value === null) continue
+      const cur = values.get(value)
+      if (cur) cur.count++
+      else values.set(value, { color: nodeColor(graph.schema, n, '#888'), count: 1 })
+    }
   }
   if (!values.size) return null
   return (
@@ -838,14 +871,26 @@ export function Sidebar() {
     <div className="sidebar">
       <div className="section">
         <h3>nodes</h3>
-        <NewNodeForm />
-        <Tree kind="node" view={view} families={nodeFamilies} shownIds={shownIds} />
+        {!STATIC_MODE && <NewNodeForm />}
+        <Tree
+          kind="node"
+          view={view}
+          families={nodeFamilies}
+          shownIds={shownIds}
+          totals={staticGraph()?.totals?.nodeTypes}
+        />
       </div>
 
       <div className="section">
         <h3>edges</h3>
-        <ConnectRow />
-        <Tree kind="edge" view={view} families={edgeFamilies} shownIds={shownIds} />
+        {!STATIC_MODE && <ConnectRow />}
+        <Tree
+          kind="edge"
+          view={view}
+          families={edgeFamilies}
+          shownIds={shownIds}
+          totals={staticGraph()?.totals?.edgeTypes}
+        />
       </div>
 
       <div className="section">

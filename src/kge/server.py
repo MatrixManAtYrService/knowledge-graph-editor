@@ -34,10 +34,24 @@ class NewGraph(BaseModel):
     id: str
 
 
-def create_app(registry: GraphRegistry, ui_dir: Path | None = None) -> FastAPI:
+def create_app(
+    registry: GraphRegistry, ui_dir: Path | None = None, site_dir: Path | None = None
+) -> FastAPI:
     app = FastAPI(title="kge server")
     audit_dir = registry.audit_dir()
     selection = SelectionState()  # transient, in-memory only (see models.SelectionState)
+
+    def sync_site() -> None:
+        """Keep the static read-only site current with the files. Best-effort:
+        an export hiccup must not turn a successful save into an error."""
+        if site_dir is None:
+            return
+        from kge.export import export_data
+
+        try:
+            export_data(registry, site_dir)
+        except Exception as exc:
+            print(f"static site export failed: {exc}")
 
     def store_or_404(graph_id: str) -> GraphStore:
         store = registry.get(graph_id)
@@ -63,6 +77,7 @@ def create_app(registry: GraphRegistry, ui_dir: Path | None = None) -> FastAPI:
             summary = store.save(graph)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        sync_site()
         return {"saved": True, **summary}
 
     @app.middleware("http")
@@ -129,6 +144,7 @@ def create_app(registry: GraphRegistry, ui_dir: Path | None = None) -> FastAPI:
             registry.create(body.id)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        sync_site()
         return {"created": body.id}
 
     @app.delete("/api/graphs/{graph_id}")
@@ -137,6 +153,7 @@ def create_app(registry: GraphRegistry, ui_dir: Path | None = None) -> FastAPI:
             registry.delete(graph_id)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        sync_site()
         return {"deleted": graph_id}
 
     @app.get("/api/graphs/{graph_id}")

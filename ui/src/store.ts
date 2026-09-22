@@ -11,6 +11,7 @@
 
 import { create } from 'zustand'
 import { createGraph, deleteGraph, fetchGraph, fetchGraphs, postSelection, putGraph } from './api'
+import { hydrateDetails, STATIC_MODE } from './static'
 import {
   alignGeom,
   computeBundleFracs,
@@ -51,6 +52,9 @@ export interface KgeState {
 
   refresh: () => Promise<void>
   save: () => Promise<void>
+  /** Static site only: pull the detail shard behind a selected item so the
+   * inspector can show its full data (graph.json carries only lite fields). */
+  hydrateSel: (sel: Sel) => Promise<void>
   view: () => View | null
   bump: () => void
   setStatus: (s: string) => void
@@ -181,6 +185,14 @@ export const useStore = create<KgeState>((set, get) => {
         set({ dirty: false, status: `saved ${graphId}` })
       } catch (e) {
         set({ status: String(e) })
+      }
+    },
+
+    hydrateSel: async (sel) => {
+      if (!STATIC_MODE) return
+      if (await hydrateDetails(sel)) {
+        // Data-only change: re-render (inspector, tooltips) without a canvas rebuild.
+        set((s) => (s.graph ? { graph: { ...s.graph } } : {}))
       }
     },
 

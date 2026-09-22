@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { skewersOf } from './graph'
+import { STATIC_MODE } from './static'
 import { useStore } from './store'
 import type { Sel } from './types'
 import { edgeKey } from './types'
@@ -18,11 +19,57 @@ function SkewerInspector({ skewerId }: { skewerId: string }) {
           <li key={m}>{m}</li>
         ))}
       </ol>
-      <div className="hint">
-        Drag a member to move the skewer; drag an end handle to rotate or stretch it. Delete
-        removes the skewer, not its members. Order lives in the graph (skewer-order edges) —
-        edit it via the CLI: kge skewer {skewer.id} &lt;members in new order&gt;
+      {!STATIC_MODE && (
+        <div className="hint">
+          Drag a member to move the skewer; drag an end handle to rotate or stretch it. Delete
+          removes the skewer, not its members. Order lives in the graph (skewer-order edges) —
+          edit it via the CLI: kge skewer {skewer.id} &lt;members in new order&gt;
+        </div>
+      )}
+    </>
+  )
+}
+
+/** Static site: show, don't edit. The full data payload arrives lazily —
+ * hydrateSel pulls the item's detail shard, and the re-render fills this in. */
+function StaticNodeInspector({ nodeId }: { nodeId: string }) {
+  const graph = useStore((s) => s.graph)!
+  const node = graph.nodes.find((n) => n.id === nodeId)
+  if (!node) return null
+  return (
+    <>
+      <div className="field-id">{node.id}</div>
+      <div className="ro-field">
+        <span className="ro-key">type</span> {node.type}
       </div>
+      {node.label && (
+        <div className="ro-field">
+          <span className="ro-key">label</span> {node.label}
+        </div>
+      )}
+      {Object.keys(node.data).length > 0 && (
+        <pre className="ro-data">{JSON.stringify(node.data, null, 2)}</pre>
+      )}
+    </>
+  )
+}
+
+function StaticEdgeInspector({ eKey }: { eKey: string }) {
+  const graph = useStore((s) => s.graph)!
+  const edge = graph.edges.find((e) => edgeKey(e) === eKey)
+  if (!edge) return null
+  return (
+    <>
+      <div className="field-id">
+        {edge.from}
+        <br />
+        -[{edge.type}]-&gt;
+        <br />
+        {edge.to}
+      </div>
+      {Object.keys(edge.data).length > 0 && (
+        <pre className="ro-data">{JSON.stringify(edge.data, null, 2)}</pre>
+      )}
     </>
   )
 }
@@ -110,16 +157,31 @@ function EdgeInspector({ eKey }: { eKey: string }) {
   )
 }
 
-/** One selection slot, fully editable — primary and secondary get the same
- * treatment, each with its own independent editors. */
+/** One selection slot — in the editor fully editable, on the static site a
+ * read-only rendering of the same facts. */
 function SlotSection({ slot, sel }: { slot: 'primary' | 'secondary'; sel: Sel }) {
+  const hydrateSel = useStore((s) => s.hydrateSel)
+  useEffect(() => {
+    if (STATIC_MODE) void hydrateSel(sel)
+  }, [hydrateSel, sel, sel.kind, sel.id])
+
   return (
     <div className={`slot slot-${slot}`}>
       <h3>
         {slot} · {sel.kind}
       </h3>
-      {sel.kind === 'node' && <NodeInspector key={sel.id} nodeId={sel.id} />}
-      {sel.kind === 'edge' && <EdgeInspector key={sel.id} eKey={sel.id} />}
+      {sel.kind === 'node' &&
+        (STATIC_MODE ? (
+          <StaticNodeInspector key={sel.id} nodeId={sel.id} />
+        ) : (
+          <NodeInspector key={sel.id} nodeId={sel.id} />
+        ))}
+      {sel.kind === 'edge' &&
+        (STATIC_MODE ? (
+          <StaticEdgeInspector key={sel.id} eKey={sel.id} />
+        ) : (
+          <EdgeInspector key={sel.id} eKey={sel.id} />
+        ))}
       {sel.kind === 'skewer' && <SkewerInspector key={sel.id} skewerId={sel.id} />}
     </div>
   )
@@ -130,7 +192,7 @@ export function Inspector() {
   const secondary = useStore((s) => s.secondary)
   const multiNodes = useStore((s) => s.multiNodes)
 
-  if (multiNodes.length > 1) {
+  if (multiNodes.length > 1 && !STATIC_MODE) {
     return (
       <div className="inspector">
         <h3>{multiNodes.length} nodes selected</h3>

@@ -2,9 +2,14 @@
 // you're on (with create/delete beside each picker), the Save/Refresh
 // buffer transitions, and layout. Element creation and per-item actions
 // (nodes, edges, skewers, pins) live in the sidebar's sections.
+//
+// On the static read-only site (STATIC_MODE) the buffer transitions and
+// create/delete buttons disappear: the pickers and layout remain, and the
+// state a visitor navigates to lives in the URL instead of a Save.
 
 import { runLayout } from './GraphCanvas'
 import { fociOf } from './graph'
+import { STATIC_MODE } from './static'
 import { useStore } from './store'
 
 export function Toolbar() {
@@ -26,7 +31,7 @@ export function Toolbar() {
 
   const onPickGraph = (id: string) => {
     if (id === graphId) return
-    if (dirty && !window.confirm('Discard local edits and switch graphs?')) return
+    if (!STATIC_MODE && dirty && !window.confirm('Discard local edits and switch graphs?')) return
     setGraphId(id)
   }
 
@@ -77,17 +82,21 @@ export function Toolbar() {
               </option>
             ))}
           </select>
-          <button className="mini-icon" onClick={onNewGraph} title="Seed a new empty graph on the server">
-            +
-          </button>
-          <button
-            className="mini-icon"
-            onClick={onDeleteGraph}
-            disabled={graphs.length <= 1}
-            title="Delete this graph — its files are removed from the server (git history is the undo)"
-          >
-            −
-          </button>
+          {!STATIC_MODE && (
+            <>
+              <button className="mini-icon" onClick={onNewGraph} title="Seed a new empty graph on the server">
+                +
+              </button>
+              <button
+                className="mini-icon"
+                onClick={onDeleteGraph}
+                disabled={graphs.length <= 1}
+                title="Delete this graph — its files are removed from the server (git history is the undo)"
+              >
+                −
+              </button>
+            </>
+          )}
         </div>
         <div className="tb-row">
           <span className="tb-label">view</span>
@@ -102,30 +111,43 @@ export function Toolbar() {
               </option>
             ))}
           </select>
-          <button
-            className="mini-icon"
-            onClick={onNewView}
-            title="Create a new view as a copy of this one — it lives in your edit buffer until you Save"
-          >
-            +
-          </button>
-          <button
-            className="mini-icon"
-            onClick={onDeleteView}
-            disabled={graph.views.length <= 1}
-            title="Delete this view (layout + filters only; the graph is untouched)"
-          >
-            −
-          </button>
+          {!STATIC_MODE && (
+            <>
+              <button
+                className="mini-icon"
+                onClick={onNewView}
+                title="Create a new view as a copy of this one — it lives in your edit buffer until you Save"
+              >
+                +
+              </button>
+              <button
+                className="mini-icon"
+                onClick={onDeleteView}
+                disabled={graph.views.length <= 1}
+                title="Delete this view (layout + filters only; the graph is untouched)"
+              >
+                −
+              </button>
+            </>
+          )}
         </div>
       </div>
       <span className="sep" />
-      <div className="tb-section">
-        <button className={dirty ? 'accent' : ''} onClick={() => void save()} disabled={!dirty}>
-          Save{dirty ? ' *' : ''}
-        </button>
-        <button onClick={onRefresh}>Refresh</button>
-      </div>
+      {STATIC_MODE ? (
+        <span
+          className="ro-badge"
+          title="A static, read-only copy of this graph. Focus, selection, and show/hide still work, and the URL always reflects what you see — copy it to share this exact view. Edits can't be saved."
+        >
+          read-only · the URL is the share link
+        </span>
+      ) : (
+        <div className="tb-section">
+          <button className={dirty ? 'accent' : ''} onClick={() => void save()} disabled={!dirty}>
+            Save{dirty ? ' *' : ''}
+          </button>
+          <button onClick={onRefresh}>Refresh</button>
+        </div>
+      )}
       <span className="sep" />
       <div className="tb-section">
         <button
