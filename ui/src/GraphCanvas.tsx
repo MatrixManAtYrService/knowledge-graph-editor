@@ -12,6 +12,7 @@ import {
   angleOf,
   axisTicks,
   compactEdges,
+  convexHull,
   defaultGeom,
   fociOf,
   formatOrderValue,
@@ -25,6 +26,7 @@ import {
   scoreArrangement,
   skewerShown,
   skewersOf,
+  smushPieces,
   snapLanes,
   visibleSets,
   type DimLevel,
@@ -561,6 +563,7 @@ export async function runLayout(): Promise<void> {
     return b ? `qb:${b}` : rail
   }
   const seen = new Set<string>()
+  const qPairs: [string, string][] = []
   for (const e of g.edges) {
     if (!visE.has(`${e.type}|${e.from}|${e.to}`)) continue
     const src = quo(e.from)
@@ -569,6 +572,7 @@ export async function runLayout(): Promise<void> {
     const key = src < dst ? `${src}~${dst}` : `${dst}~${src}`
     if (seen.has(key)) continue
     seen.add(key)
+    qPairs.push([src, dst])
     els.push({ group: 'edges', data: { id: `q:${key}`, source: src, target: dst } })
   }
   // A lane bundle is worth arranging even when it's the only thing on canvas.
@@ -582,124 +586,307 @@ export async function runLayout(): Promise<void> {
     .map((e) => ({ from: e.from, to: e.to }))
 
 
-  const TRIALS = 3
-  let best:
-    | {
-        free: Record<string, Position>
-        geoms: Record<string, SkewerGeom>
-        settled: boolean
-        score: number
-        collisions: number
-        crossings: number
-      }
-    | null = null
-
-  for (let t = 0; t < TRIALS; t++) {
-    const positions = await runQuotientTrial(els, fixed)
-
-    // Expand the quotient: translate each skewer by its meta-node's movement,
-    // then arrange each lane bundle internally at its meta-node's landing.
-    const rigs: Record<string, SkewerRig> = {}
-    for (const s of skewers) {
-      if (railBundle.has(s.id)) continue
-      const geom = geoms[s.id]
-      const oldMid = { x: (geom.a.x + geom.b.x) / 2, y: (geom.a.y + geom.b.y) / 2 }
-      const newMid = positions[s.id]
-      const dx = newMid.x - oldMid.x
-      const dy = newMid.y - oldMid.y
-      delete positions[s.id]
-      rigs[s.id] = {
-        geom: {
-          a: { x: geom.a.x + dx, y: geom.a.y + dy },
-          b: { x: geom.b.x + dx, y: geom.b.y + dy },
-          pinned: geom.pinned,
-        },
-        visMembers: mineOf[s.id],
-        ts: tsOf[s.id],
-      }
-    }
-    for (const [group, rails] of laneGroups) {
-      const centroid = bundleCentroids.get(group)!
-      const landed = positions[`qb:${group}`] ?? centroid
-      const dx = landed.x - centroid.x
-      const dy = landed.y - centroid.y
-      delete positions[`qb:${group}`]
-      const laneGeoms = layoutLaneBundle({
-        rails: rails.map((s) => {
-          const geom = geoms[s.id]
-          return {
-            id: s.id,
-            geom: geom.pinned
-              ? geom
-              : {
-                  a: { x: geom.a.x + dx, y: geom.a.y + dy },
-                  b: { x: geom.b.x + dx, y: geom.b.y + dy },
-                  pinned: false,
-                },
-            mine: mineOf[s.id],
-            ts: tsOf[s.id],
-          }
-        }),
-        positions,
-        edges: visEdgeList,
-        ownerOf: memberOf,
-        visN,
-        pinnedNodes,
-      })
-      for (const s of rails) {
-        rigs[s.id] = { geom: laneGeoms[s.id], visMembers: mineOf[s.id], ts: tsOf[s.id] }
-      }
-    }
-
-    // De-collide the real geometry, greedily shorten over-long edges while
-    // the score tolerates it, then score the settled result.
-    const resolved = resolveCollisions(positions, pinnedNodes, rigs, visEdgeList)
-    const resolvedRigs: Record<string, SkewerRig> = Object.fromEntries(
-      Object.entries(rigs).map(([sid, r]) => [
-        sid,
-        { geom: resolved.geoms[sid], visMembers: r.visMembers, ts: r.ts },
-      ]),
-    )
-    const compacted = compactEdges(resolved.free, pinnedNodes, resolvedRigs, visEdgeList)
-    // De-collision and compaction can drift an aligned bundle: re-impose the
-    // align contract against the reference rail, then re-snap the lanes to
-    // the equidistant grid (order kept; a pinned rail anchors it).
-    for (const [, rails] of laneGroups) {
-      const present = rails.map((s) => s.id).filter((id) => compacted.geoms[id])
-      const refId = present.find((id) => compacted.geoms[id].pinned) ?? present[0]
-      if (!refId) continue
-      for (const id of present) {
-        if (id === refId || compacted.geoms[id].pinned) continue
-        compacted.geoms[id] = alignGeom(compacted.geoms[refId], compacted.geoms[id])
-      }
-      Object.assign(
-        compacted.geoms,
-        snapLanes(present.map((id) => ({ id, geom: compacted.geoms[id] })), LANE_GAP),
-      )
-    }
-    const compactedRigs: Record<string, SkewerRig> = Object.fromEntries(
-      Object.entries(resolvedRigs).map(([sid, r]) => [
-        sid,
-        { geom: compacted.geoms[sid], visMembers: r.visMembers, ts: r.ts },
-      ]),
-    )
-    const sc = scoreArrangement(compacted.free, compactedRigs, visEdgeList)
-    if (!best || sc.score < best.score) {
-      best = { free: compacted.free, geoms: compacted.geoms, settled: resolved.settled, ...sc }
-    }
+  // ---- connected components of the quotient graph ----
+  // Disconnected pieces have no business mingling: each component is laid
+  // out and optimised on its own, then the pieces are packed into a grid.
+  const qIds = els.filter((e) => e.group === 'nodes').map((e) => e.data!.id as string)
+  const adjQ = new Map<string, string[]>(qIds.map((id) => [id, []]))
+  for (const [a, b] of qPairs) {
+    adjQ.get(a)?.push(b)
+    adjQ.get(b)?.push(a)
   }
-  if (!best) return
+  const compId = new Map<string, number>()
+  let nComps = 0
+  for (const id of qIds) {
+    if (compId.has(id)) continue
+    const stack = [id]
+    compId.set(id, nComps)
+    while (stack.length) {
+      for (const nb of adjQ.get(stack.pop()!) ?? []) {
+        if (!compId.has(nb)) {
+          compId.set(nb, nComps)
+          stack.push(nb)
+        }
+      }
+    }
+    nComps++
+  }
 
-  for (const [sid, geom] of Object.entries(best.geoms)) {
+  const TRIALS = 3
+  interface PieceResult {
+    free: Record<string, Position>
+    geoms: Record<string, SkewerGeom>
+    settled: boolean
+    score: number
+    collisions: number
+    crossings: number
+  }
+
+  /** The best-of-N pipeline (fcose trial, quotient expansion, de-collision,
+   * compaction, scoring), scoped to one component's elements. */
+  const layoutPiece = async (
+    pEls: cytoscape.ElementDefinition[],
+    pFixed: { nodeId: string; position: Position }[],
+    pSkewers: Skewer[],
+    pLanes: Map<string, Skewer[]>,
+    pEdges: { from: string; to: string }[],
+  ): Promise<PieceResult> => {
+    let best: PieceResult | null = null
+    for (let t = 0; t < TRIALS; t++) {
+      const positions = await runQuotientTrial(pEls, pFixed)
+
+      // Expand the quotient: translate each skewer by its meta-node's movement,
+      // then arrange each lane bundle internally at its meta-node's landing.
+      const rigs: Record<string, SkewerRig> = {}
+      for (const s of pSkewers) {
+        if (railBundle.has(s.id)) continue
+        const geom = geoms[s.id]
+        const oldMid = { x: (geom.a.x + geom.b.x) / 2, y: (geom.a.y + geom.b.y) / 2 }
+        const newMid = positions[s.id]
+        const dx = newMid.x - oldMid.x
+        const dy = newMid.y - oldMid.y
+        delete positions[s.id]
+        rigs[s.id] = {
+          geom: {
+            a: { x: geom.a.x + dx, y: geom.a.y + dy },
+            b: { x: geom.b.x + dx, y: geom.b.y + dy },
+            pinned: geom.pinned,
+          },
+          visMembers: mineOf[s.id],
+          ts: tsOf[s.id],
+        }
+      }
+      for (const [group, rails] of pLanes) {
+        const centroid = bundleCentroids.get(group)!
+        const landed = positions[`qb:${group}`] ?? centroid
+        const dx = landed.x - centroid.x
+        const dy = landed.y - centroid.y
+        delete positions[`qb:${group}`]
+        const laneGeoms = layoutLaneBundle({
+          rails: rails.map((s) => {
+            const geom = geoms[s.id]
+            return {
+              id: s.id,
+              geom: geom.pinned
+                ? geom
+                : {
+                    a: { x: geom.a.x + dx, y: geom.a.y + dy },
+                    b: { x: geom.b.x + dx, y: geom.b.y + dy },
+                    pinned: false,
+                  },
+              mine: mineOf[s.id],
+              ts: tsOf[s.id],
+            }
+          }),
+          positions,
+          edges: pEdges,
+          ownerOf: memberOf,
+          visN,
+          pinnedNodes,
+        })
+        for (const s of rails) {
+          rigs[s.id] = { geom: laneGeoms[s.id], visMembers: mineOf[s.id], ts: tsOf[s.id] }
+        }
+      }
+
+      // De-collide the real geometry, greedily shorten over-long edges while
+      // the score tolerates it, then score the settled result.
+      const resolved = resolveCollisions(positions, pinnedNodes, rigs, pEdges)
+      const resolvedRigs: Record<string, SkewerRig> = Object.fromEntries(
+        Object.entries(rigs).map(([sid, r]) => [
+          sid,
+          { geom: resolved.geoms[sid], visMembers: r.visMembers, ts: r.ts },
+        ]),
+      )
+      const compacted = compactEdges(resolved.free, pinnedNodes, resolvedRigs, pEdges)
+      // De-collision and compaction can drift an aligned bundle: re-impose the
+      // align contract against the reference rail, then re-snap the lanes to
+      // the equidistant grid (order kept; a pinned rail anchors it).
+      for (const [, rails] of pLanes) {
+        const present = rails.map((s) => s.id).filter((id) => compacted.geoms[id])
+        const refId = present.find((id) => compacted.geoms[id].pinned) ?? present[0]
+        if (!refId) continue
+        for (const id of present) {
+          if (id === refId || compacted.geoms[id].pinned) continue
+          compacted.geoms[id] = alignGeom(compacted.geoms[refId], compacted.geoms[id])
+        }
+        Object.assign(
+          compacted.geoms,
+          snapLanes(present.map((id) => ({ id, geom: compacted.geoms[id] })), LANE_GAP),
+        )
+      }
+      const compactedRigs: Record<string, SkewerRig> = Object.fromEntries(
+        Object.entries(resolvedRigs).map(([sid, r]) => [
+          sid,
+          { geom: compacted.geoms[sid], visMembers: r.visMembers, ts: r.ts },
+        ]),
+      )
+      const sc = scoreArrangement(compacted.free, compactedRigs, pEdges)
+      if (!best || sc.score < best.score) {
+        best = { free: compacted.free, geoms: compacted.geoms, settled: resolved.settled, ...sc }
+      }
+    }
+    return best!
+  }
+
+  const pieces: { result: PieceResult; anchored: boolean }[] = []
+  for (let c = 0; c < nComps; c++) {
+    const inComp = (q: string) => compId.get(q) === c
+    const pEls = els.filter((e) =>
+      e.group === 'nodes' ? inComp(e.data!.id as string) : inComp(e.data!.source as string),
+    )
+    const pFixed = fixed.filter((f) => inComp(f.nodeId))
+    const pSkewers = skewers.filter((s) =>
+      inComp(railBundle.has(s.id) ? `qb:${railBundle.get(s.id)}` : s.id),
+    )
+    const pLanes = new Map([...laneGroups].filter(([group]) => inComp(`qb:${group}`)))
+    const pEdges = visEdgeList.filter((e) => inComp(quo(e.from)))
+    const nodeEls = pEls.filter((e) => e.group === 'nodes')
+    if (nodeEls.length === 1 && !pSkewers.length) {
+      // A lone free node: nothing to optimise, just give the packer a cell.
+      const id = nodeEls[0].data!.id as string
+      pieces.push({
+        result: {
+          free: { [id]: { ...(nodeEls[0].position ?? { x: 0, y: 0 }) } },
+          geoms: {},
+          settled: true,
+          score: 0,
+          collisions: 0,
+          crossings: 0,
+        },
+        anchored: pFixed.length > 0,
+      })
+      continue
+    }
+    pieces.push({
+      result: await layoutPiece(pEls, pFixed, pSkewers, pLanes, pEdges),
+      anchored: pFixed.length > 0,
+    })
+  }
+
+  // ---- pack the pieces ----
+  // Pieces holding a pin are anchored (their pins dictate where they sit);
+  // the rest fill height-sorted shelves into a roughly square block, placed
+  // below the anchored pieces so nothing overlaps.
+  const PACK_GAP = 180
+  const PIECE_PAD = 70 // node radius + a label line of breathing room
+  const boxes = pieces.map(({ result }) => {
+    let minX = Infinity
+    let minY = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+    const take = (p: Position) => {
+      minX = Math.min(minX, p.x)
+      minY = Math.min(minY, p.y)
+      maxX = Math.max(maxX, p.x)
+      maxY = Math.max(maxY, p.y)
+    }
+    for (const p of Object.values(result.free)) take(p)
+    for (const gm of Object.values(result.geoms)) {
+      take(gm.a)
+      take(gm.b)
+    }
+    if (minX === Infinity) minX = minY = maxX = maxY = 0
+    return {
+      minX: minX - PIECE_PAD,
+      minY: minY - PIECE_PAD,
+      maxX: maxX + PIECE_PAD,
+      maxY: maxY + PIECE_PAD,
+    }
+  })
+  const shifts: (Position | null)[] = pieces.map(() => null)
+  const loose = pieces.map((_, i) => i).filter((i) => !pieces[i].anchored)
+  if (nComps > 1 && loose.length) {
+    const w = (i: number) => boxes[i].maxX - boxes[i].minX
+    const h = (i: number) => boxes[i].maxY - boxes[i].minY
+    let originX = 0
+    let originY = 0
+    const anchored = pieces.map((_, i) => i).filter((i) => pieces[i].anchored)
+    if (anchored.length) {
+      originX = Math.min(...anchored.map((i) => boxes[i].minX))
+      originY = Math.max(...anchored.map((i) => boxes[i].maxY)) + PACK_GAP
+    }
+    const area = loose.reduce((s, i) => s + w(i) * h(i), 0)
+    const rowWidth = Math.max(Math.sqrt(area) * 1.3, ...loose.map(w))
+    const order = [...loose].sort((a, b) => h(b) - h(a)) // tallest-first shelves
+    let x = originX
+    let y = originY
+    let rowH = 0
+    for (const i of order) {
+      if (x > originX && x - originX + w(i) > rowWidth) {
+        x = originX
+        y += rowH + PACK_GAP
+        rowH = 0
+      }
+      shifts[i] = { x: x - boxes[i].minX, y: y - boxes[i].minY }
+      x += w(i) + PACK_GAP
+      rowH = Math.max(rowH, h(i))
+    }
+
+    // Smush: shelf cells are bounding boxes, which waste space around
+    // irregular pieces — pull everything toward the pack's center until
+    // the pieces' hulls sit a fixed clearance apart.
+    const SMUSH_CLEARANCE = 120
+    const hulls = pieces.map(({ result }, i) => {
+      const d = shifts[i] ?? { x: 0, y: 0 }
+      const pts: Position[] = []
+      for (const p of Object.values(result.free)) pts.push({ x: p.x + d.x, y: p.y + d.y })
+      for (const gm of Object.values(result.geoms)) {
+        pts.push({ x: gm.a.x + d.x, y: gm.a.y + d.y }, { x: gm.b.x + d.x, y: gm.b.y + d.y })
+      }
+      return convexHull(pts)
+    })
+    const extra = smushPieces(
+      hulls,
+      pieces.map((p) => !p.anchored),
+      SMUSH_CLEARANCE,
+    )
+    extra.forEach((e, i) => {
+      if (e.x === 0 && e.y === 0) return
+      const d = shifts[i]
+      if (d) {
+        d.x += e.x
+        d.y += e.y
+      } else {
+        shifts[i] = { ...e }
+      }
+    })
+  }
+
+  const allFree: Record<string, Position> = {}
+  const allGeoms: Record<string, SkewerGeom> = {}
+  let collisions = 0
+  let crossings = 0
+  let settled = true
+  pieces.forEach(({ result }, i) => {
+    const d = shifts[i] ?? { x: 0, y: 0 }
+    for (const [id, p] of Object.entries(result.free)) {
+      allFree[id] = { x: p.x + d.x, y: p.y + d.y }
+    }
+    for (const [sid, gm] of Object.entries(result.geoms)) {
+      allGeoms[sid] = {
+        a: { x: gm.a.x + d.x, y: gm.a.y + d.y },
+        b: { x: gm.b.x + d.x, y: gm.b.y + d.y },
+        pinned: gm.pinned,
+      }
+    }
+    collisions += result.collisions
+    crossings += result.crossings
+    settled &&= result.settled
+  })
+
+  for (const [sid, geom] of Object.entries(allGeoms)) {
     st.setSkewerGeom(sid, geom)
   }
-  st.setPositions(best.free)
+  st.setPositions(allFree)
   fitAfterBuild.flag = true
   st.bump()
   const noun = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`
   st.setStatus(
-    `layout: best of ${TRIALS} — ${noun(best.collisions, 'collision')}, ${noun(best.crossings, 'crossing')}` +
-      (best.settled ? '' : ' (not fully resolved)') +
+    `layout: best of ${TRIALS}` +
+      (nComps > 1 ? ` × ${nComps} components, packed` : '') +
+      ` — ${noun(collisions, 'collision')}, ${noun(crossings, 'crossing')}` +
+      (settled ? '' : ' (not fully resolved)') +
       ' — click Layout again for a different roll',
   )
 }

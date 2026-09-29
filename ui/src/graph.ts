@@ -915,6 +915,9 @@ export function resolveCollisions(
     // soft minimum edge length: an edge needs room for its label between the
     // node circles. Swing-based collision fixes can shorten edges; this
     // gently re-lengthens them (free endpoints only — never drags skewers).
+    // Deliberately no soft MAXIMUM here: an unguarded contraction fights
+    // legitimately long edges and piles their endpoints into collisions —
+    // shrinking belongs to compactEdges, whose pulls are score-guarded.
     {
       const EDGE_MIN_LEN = 110
       const LEN_GAIN = 0.2
@@ -976,8 +979,15 @@ export function resolveCollisions(
           list.push({ other: null, angle: wrap(railAngle) }, { other: null, angle: wrap(railAngle + Math.PI) })
         }
       }
+      // Cap on tangential travel per iteration: a fixed rotation angle moves
+      // an endpoint proportionally to its radius, which makes spreading a
+      // scale-free expansive force no proportional contraction can beat.
+      const MAX_SPREAD_ARC = 10
       for (const [v, list] of incident) {
-        if (list.length < 2) continue
+        // Two edges never need fanning out — "equalizing" a degree-2 vertex
+        // means straightening it toward 180°, which a chain can absorb but a
+        // cycle can only satisfy by inflating without bound.
+        if (list.length < 3) continue
         const pv = pos[v]
         list.sort((x, y) => x.angle - y.angle)
         const fair = (2 * Math.PI) / list.length
@@ -997,8 +1007,10 @@ export function resolveCollisions(
             // and it never drags skewers or pinned nodes.
             if (ent.other === null || memberOf.has(ent.other) || !movable(ent.other)) continue
             const po = pos[ent.other]
-            const cos = Math.cos(sgn * dTheta)
-            const sin = Math.sin(sgn * dTheta)
+            const r = Math.hypot(po.x - pv.x, po.y - pv.y)
+            const eff = Math.min(dTheta, MAX_SPREAD_ARC / Math.max(r, 1e-6))
+            const cos = Math.cos(sgn * eff)
+            const sin = Math.sin(sgn * eff)
             const vx = po.x - pv.x
             const vy = po.y - pv.y
             const dx = pv.x + vx * cos - vy * sin - po.x
@@ -1257,6 +1269,156 @@ export function scoreArrangement(
   }
 
   return { score: pen * 10 + collisions * 100 + crossings * 25, collisions, crossings }
+}
+
+// -- component packing --------------------------------------------------------
+
+/** Andrew monotone chain (counter-clockwise); degenerate inputs pass through. */
+export function convexHull(points: Position[]): Position[] {
+  if (points.length < 3) return points.map((p) => ({ ...p }))
+  const pts = [...points].sort((p, q) => p.x - q.x || p.y - q.y)
+  const cross = (o: Position, a: Position, b: Position) =>
+    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+  const half = (src: Position[]): Position[] => {
+    const out: Position[] = []
+    for (const p of src) {
+      while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop()
+      out.push(p)
+    }
+    out.pop()
+    return out
+  }
+  const hull = [...half(pts), ...half([...pts].reverse())]
+  return hull.length ? hull.map((p) => ({ ...p })) : points.map((p) => ({ ...p }))
+}
+
+const hullEdges = (h: Position[]): [Position, Position][] =>
+  h.length >= 3
+    ? h.map((p, i) => [p, h[(i + 1) % h.length]] as [Position, Position])
+    : h.length === 2
+      ? [[h[0], h[1]]]
+      : []
+
+const pointInConvex = (p: Position, h: Position[]): boolean =>
+  h.length >= 3 &&
+  h.every((a, i) => {
+    const b = h[(i + 1) % h.length]
+    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) >= 0
+  })
+
+/** Distance between two convex hulls (0 when they touch or overlap).
+ * Degenerate hulls (points, segments) are handled by the same edge/vertex
+ * sweep. */
+export function hullClearance(a: Position[], b: Position[]): number {
+  for (const [a1, a2] of hullEdges(a)) {
+    for (const [b1, b2] of hullEdges(b)) {
+      if (segsCross(a1, a2, b1, b2)) return 0
+    }
+  }
+  if (b.length && pointInConvex(b[0], a)) return 0
+  if (a.length && pointInConvex(a[0], b)) return 0
+  let min = Infinity
+  for (const p of a) for (const q of b) min = Math.min(min, Math.hypot(p.x - q.x, p.y - q.y))
+  for (const p of a) for (const [b1, b2] of hullEdges(b)) min = Math.min(min, segPointDist(b1, b2, p).d)
+  for (const p of b) for (const [a1, a2] of hullEdges(a)) min = Math.min(min, segPointDist(a1, a2, p).d)
+  return min
+}
+
+/** Post-pack compaction: rigidly translate the movable pieces toward the
+ * pack's center of mass until they sit `clearance` apart. Hull-vs-hull
+ * distance, not bounding boxes, so diagonal pieces nest into each other's
+ * slack. Greedy annealed steps, with axis-aligned slides so a blocked piece
+ * can still creep around a neighbor. Returns one extra translation per
+ * piece (zero for immovable pieces). */
+export function smushPieces(
+  hulls: Position[][],
+  movable: boolean[],
+  clearance: number,
+): Position[] {
+  const shift: Position[] = hulls.map(() => ({ x: 0, y: 0 }))
+  if (hulls.length < 2) return shift
+  const moved = hulls.map((h) => h.map((p) => ({ ...p })))
+  const bbox = (h: Position[]) => {
+    let minX = Infinity
+    let minY = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+    for (const p of h) {
+      minX = Math.min(minX, p.x)
+      minY = Math.min(minY, p.y)
+      maxX = Math.max(maxX, p.x)
+      maxY = Math.max(maxY, p.y)
+    }
+    return { minX, minY, maxX, maxY }
+  }
+  const boxes = moved.map(bbox)
+  const centroid = (h: Position[]): Position => {
+    let sx = 0
+    let sy = 0
+    for (const p of h) {
+      sx += p.x
+      sy += p.y
+    }
+    return { x: sx / h.length, y: sy / h.length }
+  }
+  let checks = 0
+  const fits = (i: number, dx: number, dy: number): boolean => {
+    for (let j = 0; j < moved.length; j++) {
+      if (j === i) continue
+      // Cheap bbox reject before the hull sweep.
+      const a = boxes[i]
+      const b = boxes[j]
+      if (
+        a.minX + dx - clearance > b.maxX ||
+        b.minX - clearance > a.maxX + dx ||
+        a.minY + dy - clearance > b.maxY ||
+        b.minY - clearance > a.maxY + dy
+      ) {
+        continue
+      }
+      checks++
+      const cand = moved[i].map((p) => ({ x: p.x + dx, y: p.y + dy }))
+      if (hullClearance(cand, moved[j]) < clearance) return false
+    }
+    return true
+  }
+  const apply = (i: number, dx: number, dy: number) => {
+    for (const p of moved[i]) {
+      p.x += dx
+      p.y += dy
+    }
+    boxes[i] = bbox(moved[i])
+    shift[i].x += dx
+    shift[i].y += dy
+  }
+  for (let step = 128; step >= 4; step /= 2) {
+    for (let sweep = 0; sweep < 40 && checks < 60_000; sweep++) {
+      let acted = false
+      const target = centroid(moved.flat())
+      for (let i = 0; i < moved.length; i++) {
+        if (!movable[i]) continue
+        const c = centroid(moved[i])
+        const vx = target.x - c.x
+        const vy = target.y - c.y
+        const d = Math.hypot(vx, vy)
+        if (d < step) continue
+        const tries: [number, number][] = [
+          [(vx / d) * step, (vy / d) * step],
+          [Math.sign(vx) * step, 0],
+          [0, Math.sign(vy) * step],
+        ]
+        for (const [dx, dy] of tries) {
+          if ((dx !== 0 || dy !== 0) && fits(i, dx, dy)) {
+            apply(i, dx, dy)
+            acted = true
+            break
+          }
+        }
+      }
+      if (!acted) break
+    }
+  }
+  return shift
 }
 
 /** First geometry for a skewer that has none in this view: a segment through
