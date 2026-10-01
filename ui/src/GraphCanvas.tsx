@@ -1687,6 +1687,9 @@ export function GraphCanvas() {
       cy.fit(undefined, 60)
       const anySeeded = [...visN].some((id) => seed[id])
       if (!anySeeded) void runLayout() // brand-new graph: give it a first arrangement
+      // Drawn from the saved layout: final now, with no "layout:" status to
+      // wait for (scripts/ui_smoke.py waits on this or that).
+      else divRef.current?.setAttribute('data-drawn', 'saved')
     }
   }, [version, viewId])
 

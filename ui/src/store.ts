@@ -798,3 +798,7 @@ export const useStore = create<KgeState>((set, get) => {
     },
   }
 })
+
+// For browser-driven checks (scripts/ui_smoke.py): drive and inspect the
+// same store the UI uses, instead of scripting clicks.
+;(window as unknown as { __kgeStore: typeof useStore }).__kgeStore = useStore

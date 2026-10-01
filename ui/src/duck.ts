@@ -24,6 +24,7 @@ const registered = new Set<string>()
 function boot(): Promise<Duck> {
   if (duckPromise) return duckPromise
   duckPromise = (async () => {
+    const t0 = performance.now()
     const duckdb = await import(/* @vite-ignore */ DUCKDB_ESM)
     const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles())
     const workerUrl = URL.createObjectURL(
@@ -41,6 +42,9 @@ function boot(): Promise<Duck> {
     // Cache parquet footers across queries — without this every query
     // re-downloads the file metadata, which dwarfs the row groups it reads.
     await conn.query('SET enable_object_cache=true').catch(() => {})
+    // Named timings for scripts/ui_timing.py --resources (the worker's own
+    // fetches are invisible to the page's resource timings).
+    performance.measure('duck:boot', { start: t0 })
     return { duckdb, database, conn }
   })()
   return duckPromise
@@ -58,7 +62,9 @@ export async function registerParquet(name: string): Promise<void> {
 /** Run one query, rows as plain objects. */
 export async function query(sql: string): Promise<Record<string, unknown>[]> {
   const { conn } = await boot()
+  const t0 = performance.now()
   const res = await conn.query(sql)
+  performance.measure('duck:query', { start: t0 })
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return res.toArray().map((row: any) => (typeof row.toJSON === 'function' ? row.toJSON() : { ...row }))
 }
