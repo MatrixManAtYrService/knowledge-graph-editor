@@ -28,11 +28,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import tempfile
 import threading
 import time
 from pathlib import Path
+
+import httpx
 
 from kge.export import export_graph_data
 from kge.store import GraphStore
@@ -128,3 +131,50 @@ class ParquetCache:
         for d in versions[KEEP_VERSIONS:]:
             if d != keep:
                 shutil.rmtree(d, ignore_errors=True)
+
+
+# -- DuckDB-Wasm ---------------------------------------------------------------
+#
+# The browser's DuckDB JS is bundled with the UI, but its ~35 MB wasm binary
+# isn't committed (git would grow by that much per version bump). The server
+# fetches the binary once per DuckDB version into the cache and serves it,
+# so the editor works offline afterwards and never needs the browser to
+# reach a CDN. The source is overridable for networks that only reach a
+# mirror: $KGE_DUCKDB_WASM_SOURCE, a URL template with {version} and {name}.
+
+DUCKDB_WASM_SOURCE = "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@{version}/dist/{name}"
+DUCKDB_WASM_FILES = {"duckdb-eh.wasm"}
+DUCKDB_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?")
+
+
+def duckdb_wasm(version: str, name: str, root: Path | None = None) -> Path:
+    """The local copy of DuckDB-Wasm `version`'s `name`, downloading it first
+    if this is the first ask. Raises ValueError for unknown files/versions and
+    RuntimeError (naming the source) when the download fails."""
+    if name not in DUCKDB_WASM_FILES or not DUCKDB_VERSION_RE.fullmatch(version):
+        raise ValueError(f"no such DuckDB-Wasm file: {version}/{name}")
+    path = (root or default_root()) / "duckdb" / version / name
+    if path.is_file():
+        return path
+    with _lock_for(str(path)):
+        if path.is_file():
+            return path
+        url = os.environ.get("KGE_DUCKDB_WASM_SOURCE", DUCKDB_WASM_SOURCE).format(version=version, name=name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as out, httpx.stream("GET", url, follow_redirects=True, timeout=60) as r:
+                r.raise_for_status()
+                for chunk in r.iter_bytes():
+                    out.write(chunk)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"couldn't fetch DuckDB-Wasm from {url} ({exc}); "
+                "set KGE_DUCKDB_WASM_SOURCE to a reachable mirror ({version}, {name} placeholders)"
+            ) from None
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    return path

@@ -25,7 +25,7 @@
 // local delete stays deleted. `base` keeps each row as the server sent it;
 // ops.ts diffs the store against it to save.
 
-import { query, registerParquet, sqlStr } from './duck'
+import { query, registerParquet, setWasmBase, sqlStr } from './duck'
 import { SKEWER_EDGE, SKEWER_TYPE } from './graph'
 import type { EdgeT, GraphInfo, GraphPayload, NodeT, Sel, View } from './types'
 import { edgeKey } from './types'
@@ -107,8 +107,13 @@ async function getJson(url: string): Promise<unknown> {
 }
 
 export async function staticFetchGraphs(): Promise<GraphInfo[]> {
-  const raw = (await getJson('data/graphs.json')) as { graphs: GraphInfo[]; capabilities?: Capabilities }
+  const raw = (await getJson('data/graphs.json')) as {
+    graphs: GraphInfo[]
+    capabilities?: Capabilities
+    duckdbWasmBase?: string // where the server keeps DuckDB's wasm (duck.ts); absent: the CDN
+  }
   caps = raw.capabilities ?? {}
+  if (raw.duckdbWasmBase) setWasmBase(raw.duckdbWasmBase)
   return raw.graphs
 }
 

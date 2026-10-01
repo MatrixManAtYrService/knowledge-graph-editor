@@ -184,3 +184,28 @@ def test_put_returns_version(client):
     r = client.put("/api/graphs/g", json=g)
     assert r.json()["version"] == client.get("/api/graphs/g/version").json()["version"]
     assert json.loads(json.dumps(r.json()))["saved"] is True
+
+
+def test_duckdb_wasm_is_served_from_the_cache(tmp_path, monkeypatch, client):
+    from kge.cache import duckdb_wasm
+
+    with pytest.raises(ValueError):
+        duckdb_wasm("1.29.0", "duckdb-mvp.wasm", tmp_path)
+    with pytest.raises(ValueError):
+        duckdb_wasm("../x", "duckdb-eh.wasm", tmp_path)
+
+    # Unreachable source: a clear error naming the override, no partial file.
+    monkeypatch.setenv("KGE_DUCKDB_WASM_SOURCE", "http://127.0.0.1:9/{version}/{name}")
+    with pytest.raises(RuntimeError, match="KGE_DUCKDB_WASM_SOURCE"):
+        duckdb_wasm("1.29.0", "duckdb-eh.wasm", tmp_path)
+    assert not any((tmp_path / "duckdb" / "1.29.0").iterdir())
+
+    # Once cached, no network: the server serves the copy as wasm.
+    cached = tmp_path / "cache" / "duckdb" / "1.29.0" / "duckdb-eh.wasm"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"\0asm")
+    r = client.get("/duckdb/1.29.0/duckdb-eh.wasm")
+    assert r.status_code == 200 and r.content == b"\0asm"
+    assert r.headers["content-type"] == "application/wasm"
+    assert client.get("/duckdb/1.29.1/duckdb-eh.wasm").status_code == 502
+    assert client.get("/data/graphs.json").json()["duckdbWasmBase"] == "duckdb/"

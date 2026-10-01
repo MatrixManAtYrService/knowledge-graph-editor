@@ -1,21 +1,31 @@
-// DuckDB-Wasm, ebb_profile_viz's pattern: booted lazily on first query so
-// page-open never pays the multi-MB wasm download, loaded from a pinned CDN
-// build, and given parquet files as HTTP-backed virtual files — a query like
+// DuckDB-Wasm, ebb_profile_viz's pattern: booted lazily on first query,
+// and given parquet files as HTTP-backed virtual files — a query like
 // `WHERE key IN (...)` then range-requests only the row groups whose min/max
 // stats cover those keys. Every graph read goes through here, in the live
 // editor and on static exports alike (static.ts).
+//
+// The JS (module, worker) is bundled with the app; the ~35 MB wasm binary
+// isn't (it would bloat git with every bump). Where it comes from is the
+// data source's call: the live server serves a copy it fetched once into
+// its cache (data/graphs.json says where — see setWasmBase), so the editor
+// works offline and behind CDN-blocking networks; a static export has no
+// server, and its visitors fetch the binary from the CDN.
 
-// Pinned, known-good DuckDB-Wasm (avoids the withdrawn 1.3.3/1.29.2 builds).
-const DUCKDB_ESM = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm'
+import workerUrl from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url'
+
+const WASM = 'duckdb-eh.wasm'
+let wasmUrl = `https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@${__DUCKDB_VERSION__}/dist/${WASM}`
+
+/** Serve the wasm from `base` (a site-relative dir holding one subdir per
+ * DuckDB version) instead of the CDN. Must run before the first query. */
+export function setWasmBase(base: string): void {
+  wasmUrl = new URL(`${base}${__DUCKDB_VERSION__}/${WASM}`, new URL('.', window.location.href)).href
+}
 
 interface Duck {
-  // The duckdb-wasm module has no local types (CDN dynamic import).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  duckdb: any
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  database: any
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  conn: any
+  duckdb: typeof import('@duckdb/duckdb-wasm')
+  database: import('@duckdb/duckdb-wasm').AsyncDuckDB
+  conn: import('@duckdb/duckdb-wasm').AsyncDuckDBConnection
 }
 
 let duckPromise: Promise<Duck> | null = null
@@ -25,18 +35,14 @@ function boot(): Promise<Duck> {
   if (duckPromise) return duckPromise
   duckPromise = (async () => {
     const t0 = performance.now()
-    const duckdb = await import(/* @vite-ignore */ DUCKDB_ESM)
-    const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles())
-    const workerUrl = URL.createObjectURL(
-      new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' }),
-    )
+    const duckdb = await import('@duckdb/duckdb-wasm')
     const worker = new Worker(workerUrl)
     const database = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker)
-    await database.instantiate(bundle.mainModule, bundle.pthreadWorker)
-    URL.revokeObjectURL(workerUrl)
+    // The eh (wasm exceptions) build only: every current browser has them.
+    await database.instantiate(wasmUrl)
     // Never fall back to downloading a whole parquet file: range requests
-    // only (the point of windowed mode). Static hosts that matter — GitHub
-    // Pages included — support Range.
+    // only (the point of windowed loading). Static hosts that matter —
+    // GitHub Pages included — support Range, and so does the kge server.
     await database.open({ path: ':memory:', filesystem: { allowFullHTTPReads: false } })
     const conn = await database.connect()
     // Cache parquet footers across queries — without this every query

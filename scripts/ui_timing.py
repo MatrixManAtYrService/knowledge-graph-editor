@@ -68,6 +68,9 @@ RESOURCES_JS = """JSON.stringify([
 ])"""
 
 
+CDN_HOST = "cdn.jsdelivr.net"
+
+
 def find_browser() -> str:
     for c in [os.environ.get("CHROME", ""), *CANDIDATES]:
         if c and (Path(c).exists() or shutil.which(c)):
@@ -127,24 +130,30 @@ def report_profile(prof: dict, top: int) -> None:
 
 
 @contextlib.asynccontextmanager
-async def browser_page(events: list | None = None):
+async def browser_page(events: list | None = None, extra_args: list[str] | None = None):
     """A fresh headless browser profile and a Cdp session on its one page.
     With `events`, protocol events (console, exceptions) are appended there."""
     port = 9400 + os.getpid() % 500
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as profile_dir:
         proc = subprocess.Popen(
             [find_browser(), "--headless=new", f"--remote-debugging-port={port}",
-             f"--user-data-dir={profile_dir}", "--window-size=1600,1000", "about:blank"],
+             f"--user-data-dir={profile_dir}", "--window-size=1600,1000", *(extra_args or []),
+             "about:blank"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
-            for _ in range(100):
+            ws_url = None
+            for _ in range(100):  # until the debug port answers and lists the page
                 try:
                     tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json"))
-                    break
+                    ws_url = next((t["webSocketDebuggerUrl"] for t in tabs if t["type"] == "page"), None)
                 except OSError:
-                    time.sleep(0.1)
-            ws_url = next(t for t in tabs if t["type"] == "page")["webSocketDebuggerUrl"]
+                    pass
+                if ws_url:
+                    break
+                time.sleep(0.1)
+            if not ws_url:
+                raise SystemExit("the browser never offered a page to debug")
             async with websockets.connect(ws_url, max_size=2**30) as ws:
                 cdp = Cdp(ws, events)
                 await cdp.call("Page.enable")
@@ -186,7 +195,8 @@ async def wait_for_status(cdp: Cdp, pattern: str, timeout: float, t0: float | No
 
 
 async def run(args) -> None:
-    async with browser_page() as cdp:
+    extra = [f"--host-resolver-rules=MAP {CDN_HOST} ~NOTFOUND"] if args.no_cdn else []
+    async with browser_page(extra_args=extra) as cdp:
         if args.profile:
             await cdp.call("Profiler.enable")
             await cdp.call("Profiler.setSamplingInterval", interval=500)
@@ -223,6 +233,8 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=300, help="seconds before giving up")
     ap.add_argument("--profile", action="store_true", help="record and summarize a CPU profile")
     ap.add_argument("--warm", action="store_true", help="load once first; time the second (cached) load")
+    ap.add_argument("--no-cdn", action="store_true",
+                    help=f"make {CDN_HOST} unresolvable: the page must load without it")
     ap.add_argument("--resources", action="store_true", help="list network fetches, slowest first")
     ap.add_argument("--top", type=int, default=25)
     asyncio.run(run(ap.parse_args()))

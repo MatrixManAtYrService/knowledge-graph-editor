@@ -19,6 +19,8 @@ follows the JSON files whatever wrote them:
     GET /data/graphs.json                   the graph list (+ capabilities)
     GET /data/{id}/graph.json               schema, views, counts, version
     GET /data/{id}/{version}/{file}         that version's parquet (Range ok)
+    GET /duckdb/{version}/duckdb-eh.wasm    the browser's DuckDB binary, fetched
+                                            once into the cache (cache.py)
 
 Writes are sessionless: whole-state PUTs (the CLI's dump/load) or op
 batches (the browser), each one locked load-modify-save of the files.
@@ -37,7 +39,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from kge.cache import ParquetCache, fingerprint
+from kge.cache import ParquetCache, duckdb_wasm, fingerprint
 from kge.models import Graph, SelectionState
 from kge.ops import OpError, apply_ops
 from kge.store import GraphRegistry, GraphStore
@@ -45,6 +47,7 @@ from kge.store import GraphRegistry, GraphStore
 # What this server lets the browser do; a static export offers none of it.
 CAPABILITIES = {"write": True, "selection": True}
 NO_STORE = {"Cache-Control": "no-store"}
+IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
 DATA_FILES = {"nodes.parquet", "edges.parquet", "ids.parquet"}
 VERSION_RE = re.compile(r"[0-9a-f]{16}")
 
@@ -245,7 +248,10 @@ def create_app(
                     "default": gid == default,
                 }
             )
-        return JSONResponse({"graphs": out, "capabilities": CAPABILITIES}, headers=NO_STORE)
+        return JSONResponse(
+            {"graphs": out, "capabilities": CAPABILITIES, "duckdbWasmBase": "duckdb/"},
+            headers=NO_STORE,
+        )
 
     @app.get("/data/{graph_id}/graph.json")
     def data_graph(graph_id: str):
@@ -267,7 +273,17 @@ def create_app(
         if not path.is_file():
             raise HTTPException(404, f"graph {graph_id} has no version {version} (reload)")
         # Version dirs never change: cache hard.
-        return FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+        return FileResponse(path, headers=IMMUTABLE)
+
+    @app.api_route("/duckdb/{version}/{name}", methods=["GET", "HEAD"])
+    def duckdb_file(version: str, name: str):
+        try:
+            path = duckdb_wasm(version, name, cache.root)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
+        return FileResponse(path, media_type="application/wasm", headers=IMMUTABLE)
 
     # The pre-multigraph API: unqualified means the default graph. Kept so
     # data repos pinning an older CLI against a newer server still work.
