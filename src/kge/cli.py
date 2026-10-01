@@ -19,8 +19,9 @@ from typing import Annotated
 import httpx
 import typer
 from rich.console import Console
+from rich.markup import escape
 
-from kge.models import Edge, Graph, Node, TypeDef
+from kge.models import FLOW_DIRECTIONS, Edge, Graph, Node, TypeDef
 
 console = Console()
 app = typer.Typer(
@@ -275,55 +276,21 @@ def export(
     )
 
 
-@app.command()
-def sql(
-    query_text: Annotated[
-        str,
-        typer.Argument(
-            metavar="QUERY",
-            help="DuckDB SQL over the exported parquet tables ('-' reads stdin)",
-        ),
-    ],
-    dir: Annotated[
-        Path,
-        typer.Option("--dir", help="Exported site directory (what kge export --out wrote)"),
-    ] = Path("docs"),
-    graph: Annotated[
-        str,
-        typer.Option(
-            "--graph",
-            "-g",
-            help="Graph whose tables get the bare names nodes/edges/ids "
-            "(default: the export's default graph)",
-        ),
-    ] = "",
-    fmt: Annotated[str, typer.Option("--format", "-f", help="table | json | csv")] = "table",
-) -> None:
-    """Query an exported site's parquet data with DuckDB.
+def _sql_prefix(graph_id: str) -> str:
+    import re
 
-    Every graph's tables are registered as <graph>_nodes, <graph>_edges,
-    <graph>_ids (non-word characters become underscores); the default graph
-    — or the one picked with --graph — also gets the bare names nodes,
-    edges, ids. Columns:
+    return re.sub(r"\W", "_", graph_id)
 
-      nodes: key (the share-URL integer), id, type, label, lite (JSON),
-             data (full JSON; NULL when lite covers it), adj (JSON
-             adjacency: [edgeKey, otherKey, edgeType, otherType, outgoing])
-      edges: key, type, src, dst, src_key, dst_key, lite, data
-      ids:   id -> key, sorted by id
 
-    For "exactly what does saved view X show", use `kge views X` — focus
-    and eye resolution live there. sql is for everything else: ad-hoc
-    structure questions, integer lookups for share URLs, sweeps over data.
-    """
-    import re as _re
-
+def _export_conn(site: Path, graph: str):
+    """DuckDB over an exported site's parquet: <graph>_{nodes,edges,ids} per
+    graph, bare names for the default (or picked) graph."""
     import duckdb
 
-    data_dir = dir / "data"
+    data_dir = site / "data"
     graphs_meta = data_dir / "graphs.json"
     if not graphs_meta.is_file():
-        raise _fail(f"{dir} is not an exported site (no data/graphs.json) — run: kge export --out {dir}")
+        raise _fail(f"{site} is not an exported site (no data/graphs.json) — run: kge export --out {site}")
     entries = json.loads(graphs_meta.read_text()).get("graphs", [])
     if not entries:
         raise _fail("the export contains no graphs")
@@ -343,12 +310,135 @@ def sql(
             conn.execute(f'CREATE OR REPLACE VIEW "{view}" AS SELECT * FROM read_parquet(\'{path}\')')
 
     for entry in entries:
-        prefix = _re.sub(r"\W", "_", entry["id"])
+        prefix = _sql_prefix(entry["id"])
         for t in tables:
             register(f"{prefix}_{t}", entry["id"], t)
     for t in tables:
         register(t, bare_gid, t)  # bare names last, so they win any collision
+    return conn
 
+
+def sql_connect_graphs(graphs: dict[str, Graph], bare: str):
+    """DuckDB over in-memory graphs: <graph>_{nodes,edges} per graph, bare
+    nodes/edges for `bare`. data is JSON; lite repeats it, so queries written
+    against an export (lite->>'field', COALESCE(data, lite)) run unchanged."""
+    import duckdb
+    import pyarrow as pa
+
+    conn = duckdb.connect()
+    raw = iter(range(1 << 30))
+
+    def register(prefix: str, g: Graph) -> None:
+        """Views <prefix>nodes / <prefix>edges over g."""
+        nodes = pa.table(
+            {
+                "id": [n.id for n in g.nodes],
+                "type": [n.type for n in g.nodes],
+                "label": [n.label for n in g.nodes],
+                "data": [json.dumps(n.data) for n in g.nodes],
+            }
+        )
+        edges = pa.table(
+            {
+                "type": [e.type for e in g.edges],
+                "src": [e.src for e in g.edges],
+                "dst": [e.dst for e in g.edges],
+                "data": [json.dumps(e.data) for e in g.edges],
+            }
+        )
+        i = next(raw)
+        conn.register(f"__raw_nodes_{i}", nodes)
+        conn.register(f"__raw_edges_{i}", edges)
+        conn.execute(
+            f'CREATE OR REPLACE VIEW "{prefix}nodes" AS SELECT id, type, label, '
+            f'data::JSON AS data, data::JSON AS lite FROM "__raw_nodes_{i}"'
+        )
+        conn.execute(
+            f'CREATE OR REPLACE VIEW "{prefix}edges" AS SELECT type, src, dst, '
+            f'data::JSON AS data, data::JSON AS lite FROM "__raw_edges_{i}"'
+        )
+
+    for gid, g in graphs.items():
+        register(_sql_prefix(gid) + "_", g)
+    if bare in graphs:
+        register("", graphs[bare])  # bare names last, so they win any collision
+    return conn
+
+
+def _live_conn(server: str, graph: str):
+    try:
+        resp = httpx.get(f"{server}/api/graphs", timeout=30.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise _fail(
+            f"can't reach the kge server at {server}: {exc} "
+            "(to query an export instead: kge sql --dir <site> ...)"
+        )
+    entries = resp.json().get("graphs", [])
+    if not entries:
+        raise _fail("the server offers no graphs")
+    ids = [e["id"] for e in entries]
+    if graph and graph not in ids:
+        raise _fail(f"no such graph: {graph} (available: {', '.join(ids)})")
+    bare = graph or next((e["id"] for e in entries if e.get("default")), ids[0])
+    return sql_connect_graphs({gid: _fetch(server, gid) for gid in ids}, bare)
+
+
+@app.command()
+def sql(
+    query_text: Annotated[
+        str,
+        typer.Argument(
+            metavar="QUERY",
+            help="DuckDB SQL over the graph tables ('-' reads stdin)",
+        ),
+    ],
+    dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--dir",
+            help="Query an exported site (what kge export --out wrote) instead of the live server",
+        ),
+    ] = None,
+    graph: Annotated[
+        str,
+        typer.Option(
+            "--graph",
+            "-g",
+            help="Graph whose tables get the bare names nodes/edges "
+            "(default: the server's / export's default graph)",
+        ),
+    ] = DEFAULT_GRAPH,
+    fmt: Annotated[str, typer.Option("--format", "-f", help="table | json | csv")] = "table",
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """Query graphs with DuckDB — the live server's, or an exported site's.
+
+    Every graph's tables are registered as <graph>_nodes, <graph>_edges
+    (non-word characters become underscores); the default graph — or the
+    one picked with --graph — also gets the bare names nodes, edges.
+
+    Live (default) columns:
+
+      nodes: id, type, label, data (JSON), lite (= data)
+      edges: type, src, dst, data (JSON), lite (= data)
+
+    Export (--dir) columns add the share-URL integers and adjacency:
+
+      nodes: key, id, type, label, lite (JSON hot fields),
+             data (full JSON; NULL when lite covers it), adj (JSON
+             adjacency: [edgeKey, otherKey, edgeType, otherType, outgoing])
+      edges: key, type, src, dst, src_key, dst_key, lite, data
+      ids:   id -> key, sorted by id
+
+    For "exactly what does saved view X show", use `kge views X` — focus
+    and eye resolution live there. For flow questions ("what does X
+    reach?") use `kge reaches` / `kge reached-by`. sql is for everything
+    else: ad-hoc structure questions, sweeps over data.
+    """
+    import duckdb
+
+    conn = _export_conn(dir, graph) if dir is not None else _live_conn(server, graph)
     q = sys.stdin.read() if query_text.strip() == "-" else query_text
     try:
         rel = conn.sql(q)
@@ -395,7 +485,8 @@ you're both on the same one. `kge add-graph <id>` seeds a new empty graph.
 [bold]Where state lives[/bold] (one directory per graph — graphs/<id>/ when the
 repo serves several, graph/ when it serves one)
 
-  <dir>/schema.json        node/edge type vocabulary (colors, families)
+  <dir>/schema.json        node/edge type vocabulary (colors, families,
+                           edge flow directions)
   <dir>/nodes.json         the nodes            } the knowledge —
   <dir>/edges.json         the edges            } committed to git
   <dir>/views/<id>.json    named views: type filters, per-item overrides,
@@ -463,37 +554,48 @@ repo serves several, graph/ when it serves one)
     without being logically connected to (uses the view's saved geometry —
     ask them to Save first if they've been dragging).
 
+[bold]Following flow — reaches, reached-by, path[/bold]
+
+  An edge type can declare a flow direction in the schema (`kge add-type
+  edge CALLS --flow fwd`; `rev` when flow runs against the arrow, e.g.
+  handler -HANDLES-> endpoint). `kge reaches X` / `kge reached-by X` walk
+  only those edge types — ownership and hub edges stay unwalked, so the
+  answer doesn't sprawl. `-t <type>` filters results, `--chains` shows the
+  shortest chain behind each, `--json` for machines. `kge path A B` finds
+  shortest connections over any edge (or flow only, with --flow).
+
 [bold]Exploring with SQL — usually your cheapest read[/bold]
 
-  `kge sql "QUERY"` runs DuckDB over the exported parquet (default
-  --dir docs; export first with `kge export --out docs` if it's missing).
-  For anything beyond a single node — counts, filters, joins, neighborhood
-  questions — this beats dumping the graph and grepping, and it costs the
-  context of one result set instead of the whole payload:
+  `kge sql "QUERY"` runs DuckDB over the live server's graphs (or over an
+  exported site with --dir docs). For anything beyond a single node —
+  counts, filters, joins, sweeps over data — this beats dumping the graph
+  and grepping, and it costs the context of one result set instead of the
+  whole payload:
 
     kge sql "SELECT type, count(*) FROM nodes GROUP BY 1"
-    kge sql "SELECT id, label FROM nodes WHERE lite->>'actor' = 'Jia Tan'"
+    kge sql "SELECT id, label FROM nodes WHERE data->>'actor' = 'Jia Tan'"
     kge sql "SELECT src, dst FROM edges WHERE type = 'MERGED_AS'"
     kge sql -g other-graph -f json "SELECT ... "   # pick graph; json/csv out
 
-  Tables per graph: <graph>_nodes/_edges/_ids, with bare nodes/edges/ids
-  aliased to the default (or -g) graph. Columns to know: nodes.key is the
-  integer share-URLs use; nodes.lite (JSON) always carries the hot fields
-  (the schema's colorKey, skewer orderKeys) — filter on lite, not data,
-  for those; nodes.data is the full payload and NULL when lite already
-  holds everything (COALESCE(data, lite) reads both); nodes.adj is the
-  adjacency list \\[edgeKey, otherKey, edgeType, otherType, outgoing] —
-  one-hop questions without touching the edge table.
+  Tables per graph: <graph>_nodes/_edges, with bare nodes/edges aliased to
+  the default (or -g) graph. Live columns: nodes(id, type, label, data),
+  edges(type, src, dst, data); data is JSON, and `lite` repeats it so
+  export-style queries run on both.
 
-  Two boundaries: the export is a MIRROR — after editing, re-export (or run
-  the server with --site-dir so saves do it) before trusting `kge sql`; and
-  "what does saved view X show" belongs to `kge views X`, which applies the
+  Against an export (--dir): it is a MIRROR — re-export after editing (or
+  run the server with --site-dir so saves do it). It adds <graph>_ids and
+  columns: nodes.key (the integer share-URLs use), nodes.lite (the hot
+  fields only — the schema's colorKey, skewer orderKeys), nodes.data (NULL
+  when lite holds everything; COALESCE(data, lite) reads both), nodes.adj
+  (\\[edgeKey, otherKey, edgeType, otherType, outgoing]).
+
+  "What does saved view X show" belongs to `kge views X`, which applies the
   focus/eye resolution SQL doesn't know about.
 
 [bold]Reading and editing[/bold]
 
   read:  status · graphs · ls · show · types · views · selection ·
-         find-collisions · dump · sql
+         find-collisions · reaches · reached-by · path · dump · sql
   edit:  add-graph · add-node · rm-node · add-edge · rm-edge · add-type ·
          skewer · load
 
@@ -597,9 +699,142 @@ def show(
     console.print_json(data=node.model_dump())
     for e in g.edges:
         if e.src == node_id:
-            console.print(f"  -[{e.type}]-> {e.dst}  [dim]{e.data.get('note', '')}[/dim]")
+            console.print(f"  {escape(f'-[{e.type}]-> {e.dst}')}  [dim]{_edge_data_text(e)}[/dim]", highlight=False)
         if e.dst == node_id:
-            console.print(f"  <-[{e.type}]- {e.src}  [dim]{e.data.get('note', '')}[/dim]")
+            console.print(f"  {escape(f'<-[{e.type}]- {e.src}')}  [dim]{_edge_data_text(e)}[/dim]", highlight=False)
+
+
+def _edge_data_text(e: Edge) -> str:
+    """The note first (the usual evidence), then any other data as JSON."""
+    rest = {k: v for k, v in e.data.items() if k != "note"}
+    parts = [str(e.data["note"])] if e.data.get("note") else []
+    if rest:
+        parts.append(json.dumps(rest, ensure_ascii=False))
+    return escape("  ".join(parts))
+
+
+def _print_chain(chain: list[dict]) -> None:
+    """One line per step, written in the direction the edge points."""
+    for step in chain:
+        arrow = escape(f"-[{step['type']}]->")
+        note = escape((step.get("data") or {}).get("note", ""))
+        tail = f"  [dim]{note}[/dim]" if note else ""
+        console.print(f"      {escape(step['from'])} {arrow} {escape(step['to'])}{tail}", highlight=False)
+
+
+def _reach_command(node_id: str, forward: bool, types: list[str] | None, max_hops: int,
+                   chains: bool, as_json: bool, graph: str, server: str) -> None:
+    from kge.traverse import reach
+
+    g = _fetch(server, graph)
+    if not any(td.flow for td in g.graph_schema.edgeTypes.values()):
+        raise _fail(
+            "no edge type in this graph's schema declares a flow direction, so there is "
+            "nothing to walk — set one with: kge add-type edge <TYPE> --flow fwd|rev"
+        )
+    try:
+        results = reach(g, node_id, forward=forward, node_types=types, max_hops=max_hops)
+    except KeyError:
+        raise _fail(f"no such node: {node_id} (kge ls --grep ... finds ids)")
+    if as_json:
+        print(json.dumps({"node": node_id, "direction": "forward" if forward else "backward",
+                          "results": results}, indent=2, ensure_ascii=False))
+        return
+    if not results:
+        console.print("[dim]nothing reached[/dim]")
+        return
+    for r in results:
+        console.print(f"{escape(r['node'])}  [dim]({r['type']}, {r['hops']} hop{'s' if r['hops'] != 1 else ''})[/dim]", highlight=False)
+        if chains:
+            _print_chain(r["chain"])
+
+
+TypesOpt = Annotated[
+    list[str] | None,
+    typer.Option("--type", "-t", help="Only report nodes of this type (repeatable)"),
+]
+MaxHopsOpt = Annotated[int, typer.Option("--max-hops", help="Maximum flow-path length")]
+ChainsOpt = Annotated[bool, typer.Option("--chains", help="Print each result's shortest chain")]
+JsonOpt = Annotated[bool, typer.Option("--json", help="Machine-readable output (includes chains)")]
+
+
+@app.command()
+def reaches(
+    node_id: Annotated[str, typer.Argument(help="Start node id")],
+    type: TypesOpt = None,
+    max_hops: MaxHopsOpt = 10,
+    chains: ChainsOpt = False,
+    as_json: JsonOpt = False,
+    graph: GraphOpt = DEFAULT_GRAPH,
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """What does this node reach, following flow edges forward?
+
+    Only edge types whose schema entry declares `flow` (fwd: from → to,
+    rev: to → from) are walked; the rest — ownership, hubs — are not, so
+    answers stay specific. Each result carries its hop count and one
+    shortest chain (--chains / --json).
+
+    Example: kge reaches task:merchant_cycle.cmm_preload.poll -t endpoint
+    """
+    _reach_command(node_id, True, type, max_hops, chains, as_json, graph, server)
+
+
+@app.command("reached-by")
+def reached_by(
+    node_id: Annotated[str, typer.Argument(help="End node id")],
+    type: TypesOpt = None,
+    max_hops: MaxHopsOpt = 10,
+    chains: ChainsOpt = False,
+    as_json: JsonOpt = False,
+    graph: GraphOpt = DEFAULT_GRAPH,
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """What reaches this node, walking flow edges backwards?
+
+    The direct answer to "which tasks ultimately hit this endpoint/table?".
+    Chains read in flow order (result → … → this node).
+
+    Example: kge reached-by table:billing_bookkeeper.billing_entity -t task
+    """
+    _reach_command(node_id, False, type, max_hops, chains, as_json, graph, server)
+
+
+@app.command()
+def path(
+    src: Annotated[str, typer.Argument(help="Start node id")],
+    dst: Annotated[str, typer.Argument(help="End node id")],
+    max_hops: Annotated[int, typer.Option("--max-hops", help="Maximum path length")] = 8,
+    max_paths: Annotated[int, typer.Option("--max-paths", help="Maximum number of paths")] = 5,
+    flow: Annotated[
+        bool, typer.Option("--flow", help="Walk forward flow only, instead of any edge either way")
+    ] = False,
+    as_json: JsonOpt = False,
+    graph: GraphOpt = DEFAULT_GRAPH,
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """Shortest paths between two nodes.
+
+    By default any edge is walked in either direction — "how are these
+    connected at all?" — and each step shows the edge's true direction.
+    --flow restricts the walk to forward flow edges.
+    """
+    from kge.traverse import paths
+
+    g = _fetch(server, graph)
+    try:
+        found = paths(g, src, dst, max_hops=max_hops, max_paths=max_paths, flow_only=flow)
+    except KeyError as exc:
+        raise _fail(f"no such node: {exc.args[0]} (kge ls --grep ... finds ids)")
+    if as_json:
+        print(json.dumps({"src": src, "dst": dst, "paths": found}, indent=2, ensure_ascii=False))
+        return
+    if not found:
+        console.print(f"[dim]no path within {max_hops} hops[/dim]")
+        return
+    for i, p in enumerate(found, 1):
+        console.print(f"path {i}  [dim]({len(p)} hop{'s' if len(p) != 1 else ''})[/dim]")
+        _print_chain(p)
 
 
 @app.command()
@@ -797,7 +1032,8 @@ def types(graph: GraphOpt = DEFAULT_GRAPH, server: ServerOpt = DEFAULT_SERVER) -
         ecounts[e.type] = ecounts.get(e.type, 0) + 1
     console.print("[bold]edge types[/bold]")
     for name, td in sorted(g.graph_schema.edgeTypes.items()):
-        console.print(f"  {name} ({ecounts.get(name, 0)})  [dim]{td.description}[/dim]")
+        flow = f" flow:{td.flow}" if td.flow else ""
+        console.print(f"  {name} ({ecounts.get(name, 0)}){flow}  [dim]{td.description}[/dim]")
 
 
 # -- write-through edit commands ----------------------------------------------
@@ -896,17 +1132,41 @@ def add_type(
     name: Annotated[str, typer.Argument(help="Type name")],
     color: Annotated[str, typer.Option("--color", help="Hex color for the UI")] = "",
     description: Annotated[str, typer.Option("--description", "-d")] = "",
+    family: Annotated[str, typer.Option("--family", help="Grouping above type in the UI tree")] = "",
+    flow: Annotated[
+        str,
+        typer.Option(
+            "--flow",
+            help="Edge types only: fwd (flow runs from → to), rev (to → from), or "
+            "none (not walked by reaches/reached-by)",
+        ),
+    ] = "",
     graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
-    """Add a node or edge type to the schema."""
+    """Add a node or edge type to the schema, or update the given fields of an existing one."""
     if kind not in ("node", "edge"):
         raise _fail("kind must be 'node' or 'edge'")
+    if flow and kind != "edge":
+        raise _fail("--flow applies to edge types only")
+    if flow and flow not in (*FLOW_DIRECTIONS, "none"):
+        raise _fail("--flow must be fwd, rev, or none")
     g = _fetch(server, graph)
     block = g.graph_schema.nodeTypes if kind == "node" else g.graph_schema.edgeTypes
-    block[name] = TypeDef(color=color, description=description)
+    td = block.get(name)
+    verb = "updated" if td else "added"
+    td = td or TypeDef()
+    if color:
+        td.color = color
+    if description:
+        td.description = description
+    if family:
+        td.family = family
+    if flow:
+        td.flow = None if flow == "none" else flow
+    block[name] = td
     _push(server, graph, g)
-    console.print(f"added {kind} type {name}")
+    console.print(f"{verb} {kind} type {name}")
 
 
 @app.command()

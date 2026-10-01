@@ -9,13 +9,31 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+
+FLOW_DIRECTIONS = ("fwd", "rev")
 
 
 class TypeDef(BaseModel):
     color: str = ""
     description: str = ""
     family: str = ""  # grouping level above type in the visibility tree
+    # Edge types only: how flow (execution, data, dependency — whatever the
+    # graph means by it) runs along edges of this type. "fwd": from → to;
+    # "rev": to → from (e.g. HANDLES points handler → endpoint, but a call
+    # flows endpoint → handler). Unset: not a flow edge — ownership or hub
+    # edges that would connect everything to everything if traversed.
+    # `kge reaches` / `kge reached-by` walk only flow edges.
+    flow: Literal["fwd", "rev"] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_flow(self, handler):
+        # Keep existing schema.json files byte-identical: flow is written only
+        # where it's set.
+        out = handler(self)
+        if out.get("flow") is None:
+            out.pop("flow", None)
+        return out
 
 
 class GraphSchema(BaseModel):
@@ -190,6 +208,9 @@ class Graph(BaseModel):
     def validate_semantics(self) -> list[str]:
         """Semantic errors that should reject a save (shape errors are pydantic's job)."""
         errors: list[str] = []
+        for name, td in self.graph_schema.nodeTypes.items():
+            if td.flow is not None:
+                errors.append(f"node type {name}: flow applies to edge types only")
         node_ids: set[str] = set()
         for n in self.nodes:
             if n.id in node_ids:

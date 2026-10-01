@@ -4,6 +4,7 @@ export interface TypeDef {
   color: string
   description: string
   family?: string // grouping level above type in the visibility tree
+  flow?: 'fwd' | 'rev' // edge types only: direction flow runs (kge reaches/reached-by)
 }
 
 export interface GraphSchema {
