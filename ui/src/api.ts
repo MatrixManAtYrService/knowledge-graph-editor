@@ -1,17 +1,18 @@
-import { STATIC_MODE, staticFetchGraph, staticFetchGraphs } from './static'
+import type { Op } from './ops'
+import { capabilities, staticFetchGraph, staticFetchGraphs } from './static'
 import type { GraphInfo, GraphPayload, Sel } from './types'
 
 /** Publish the two-slot selection and current graph + view so agents can read
  * them (kge selection, kge find-collisions). Fire-and-forget: transient
- * state, last writer wins. On the static site there is nobody to tell — the
- * URL hash (share.ts) carries the selection instead. */
+ * state, last writer wins. Without the capability (a static export) there is
+ * nobody to tell — the URL hash (share.ts) carries the selection instead. */
 export function postSelection(
   primary: Sel | null,
   secondary: Sel | null,
   graph: string,
   view: string,
 ): void {
-  if (STATIC_MODE) return
+  if (!capabilities().selection) return
   void fetch('/api/selection', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -32,38 +33,42 @@ async function fail(resp: Response, what: string): Promise<Error> {
 
 const readOnly = (): Error => new Error('this is a read-only site — edits cannot be saved here')
 
-export async function fetchGraphs(): Promise<GraphInfo[]> {
-  if (STATIC_MODE) return staticFetchGraphs()
-  const resp = await fetch('/api/graphs')
-  if (!resp.ok) throw await fail(resp, 'GET /api/graphs failed')
-  return (await resp.json()).graphs
+// Reads go through the data layer (static.ts) in every mode: the live
+// server serves the same data/ URLs a static export has.
+export const fetchGraphs = (): Promise<GraphInfo[]> => staticFetchGraphs()
+export const fetchGraph = (graphId: string): Promise<GraphPayload> => staticFetchGraph(graphId)
+
+export interface OpsResult {
+  version: string
+  moved: boolean // the graph had changed on the server since baseVersion
 }
 
-export async function fetchGraph(graphId: string): Promise<GraphPayload> {
-  if (STATIC_MODE) return staticFetchGraph(graphId)
-  const resp = await fetch(`/api/graphs/${encodeURIComponent(graphId)}`)
-  if (!resp.ok) throw await fail(resp, `GET graph ${graphId} failed`)
+export async function postOps(graphId: string, ops: Op[], baseVersion: string): Promise<OpsResult> {
+  if (!capabilities().write) throw readOnly()
+  const resp = await fetch(`/api/graphs/${encodeURIComponent(graphId)}/ops`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ops, base_version: baseVersion || null }),
+  })
+  if (!resp.ok) throw await fail(resp, 'save rejected')
   return resp.json()
 }
 
-export async function putGraph(graphId: string, graph: GraphPayload): Promise<void> {
-  if (STATIC_MODE) throw readOnly()
-  const resp = await fetch(`/api/graphs/${encodeURIComponent(graphId)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(graph),
-  })
-  if (!resp.ok) throw await fail(resp, 'save rejected')
+/** The graph files' current version (cheap: a stat, no export). */
+export async function fetchVersion(graphId: string): Promise<string> {
+  const resp = await fetch(`/api/graphs/${encodeURIComponent(graphId)}/version`)
+  if (!resp.ok) throw await fail(resp, `GET version of ${graphId} failed`)
+  return (await resp.json()).version
 }
 
 export async function deleteGraph(graphId: string): Promise<void> {
-  if (STATIC_MODE) throw readOnly()
+  if (!capabilities().write) throw readOnly()
   const resp = await fetch(`/api/graphs/${encodeURIComponent(graphId)}`, { method: 'DELETE' })
   if (!resp.ok) throw await fail(resp, 'delete graph rejected')
 }
 
 export async function createGraph(graphId: string): Promise<void> {
-  if (STATIC_MODE) throw readOnly()
+  if (!capabilities().write) throw readOnly()
   const resp = await fetch('/api/graphs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

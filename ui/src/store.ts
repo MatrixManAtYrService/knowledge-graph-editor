@@ -10,8 +10,9 @@
 // (Skewer, Pin, Delete) via `multiNodes`.
 
 import { create } from 'zustand'
-import { createGraph, deleteGraph, fetchGraph, fetchGraphs, postSelection, putGraph } from './api'
-import { hydrateDetails, STATIC_MODE } from './static'
+import { createGraph, deleteGraph, fetchGraph, fetchGraphs, postOps, postSelection } from './api'
+import { diffOps } from './ops'
+import { capabilities, type Capabilities, hydrateDetails, staticGraph } from './static'
 import {
   alignGeom,
   computeBundleFracs,
@@ -35,6 +36,7 @@ export interface KgeState {
   graphs: GraphInfo[] // what the server offers (the graph picker's entries)
   graphId: string // which one `graph` is
   viewId: string
+  caps: Capabilities // what the data source allows (static.ts); {} = read-only
   dirty: boolean
   version: number
   primary: Sel | null
@@ -52,8 +54,8 @@ export interface KgeState {
 
   refresh: () => Promise<void>
   save: () => Promise<void>
-  /** Static site only: pull the detail shard behind a selected item so the
-   * inspector can show its full data (graph.json carries only lite fields). */
+  /** Pull the full data behind a selected item (the loaded rows carry only
+   * the lite fields rendering needs) so the inspector can show and edit it. */
   hydrateSel: (sel: Sel) => Promise<void>
   view: () => View | null
   bump: () => void
@@ -137,6 +139,7 @@ export const useStore = create<KgeState>((set, get) => {
     graphs: [],
     graphId: '',
     viewId: 'default',
+    caps: {},
     dirty: false,
     version: 0,
     primary: null,
@@ -164,6 +167,7 @@ export const useStore = create<KgeState>((set, get) => {
           graph: g,
           graphs,
           graphId,
+          caps: capabilities(),
           dirty: false,
           version: s.version + 1,
           viewId: g.views.some((v) => v.id === s.viewId) ? s.viewId : (g.views[0]?.id ?? 'default'),
@@ -177,19 +181,30 @@ export const useStore = create<KgeState>((set, get) => {
       }
     },
 
+    /** Send what changed as ops, then reload at the new version (integers
+     * renumber on every save, so the loaded rows can't be patched in place);
+     * the selection carries over by id. */
     save: async () => {
       const { graph: g, graphId } = get()
       if (!g || !graphId) return
       try {
-        await putGraph(graphId, g)
-        set({ dirty: false, status: `saved ${graphId}` })
+        const ops = diffOps(g)
+        if (!ops.length) return set({ dirty: false, status: 'nothing to save' })
+        const res = await postOps(graphId, ops, staticGraph()?.version ?? '')
+        const { primary, secondary } = get()
+        await get().refresh()
+        setSelection(primary, secondary)
+        set({
+          status:
+            `saved ${graphId}: ${ops.length} change${ops.length === 1 ? '' : 's'}` +
+            (res.moved ? ' (the graph had also changed on the server; reloaded with both)' : ''),
+        })
       } catch (e) {
         set({ status: String(e) })
       }
     },
 
     hydrateSel: async (sel) => {
-      if (!STATIC_MODE) return
       if (await hydrateDetails(sel)) {
         // Data-only change: re-render (inspector, tooltips) without a canvas rebuild.
         set((s) => (s.graph ? { graph: { ...s.graph } } : {}))

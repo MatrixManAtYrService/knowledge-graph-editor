@@ -9,23 +9,44 @@ keeps the two-endpoint editing model:
     PUT /api/graphs/{id}          replace that graph, whole (clobber, never merge)
     GET|PUT /api/graph            the default graph (the pre-multigraph API)
 
-Every mutating call is one whole-state write, so there is nothing to session:
-the browser's memory and the CLI's working.json are the only edit buffers.
+    POST /api/graphs/{id}/ops     apply a batch of edit operations (ops.py)
+    GET /api/graphs/{id}/version  the graph files' current version token
+
+The browser reads graphs the way a static site does: the same data/ URLs a
+`kge export` site has, served from the parquet cache (cache.py), which
+follows the JSON files whatever wrote them:
+
+    GET /data/graphs.json                   the graph list (+ capabilities)
+    GET /data/{id}/graph.json               schema, views, counts, version
+    GET /data/{id}/{version}/{file}         that version's parquet (Range ok)
+
+Writes are sessionless: whole-state PUTs (the CLI's dump/load) or op
+batches (the browser), each one locked load-modify-save of the files.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from kge.cache import ParquetCache, fingerprint
 from kge.models import Graph, SelectionState
+from kge.ops import OpError, apply_ops
 from kge.store import GraphRegistry, GraphStore
+
+# What this server lets the browser do; a static export offers none of it.
+CAPABILITIES = {"write": True, "selection": True}
+NO_STORE = {"Cache-Control": "no-store"}
+DATA_FILES = {"nodes.parquet", "edges.parquet", "ids.parquet"}
+VERSION_RE = re.compile(r"[0-9a-f]{16}")
 
 _STARTED_AT = time.time()
 
@@ -34,10 +55,21 @@ class NewGraph(BaseModel):
     id: str
 
 
+class OpBatch(BaseModel):
+    ops: list[dict]
+    # The version the client loaded. Informational: a mismatch is reported
+    # back ("moved") so the client can reload, never rejected.
+    base_version: str | None = None
+
+
 def create_app(
-    registry: GraphRegistry, ui_dir: Path | None = None, site_dir: Path | None = None
+    registry: GraphRegistry,
+    ui_dir: Path | None = None,
+    site_dir: Path | None = None,
+    cache: ParquetCache | None = None,
 ) -> FastAPI:
     app = FastAPI(title="kge server")
+    cache = cache or ParquetCache()
     audit_dir = registry.audit_dir()
     selection = SelectionState()  # transient, in-memory only (see models.SelectionState)
 
@@ -74,11 +106,20 @@ def create_app(
 
     def save(store: GraphStore, graph: Graph) -> dict:
         try:
-            summary = store.save(graph)
+            with store.locked():
+                summary = store.save(graph)
+                version = fingerprint(store)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         sync_site()
-        return {"saved": True, **summary}
+        return {"saved": True, "version": version, **summary}
+
+    def cached(graph_id: str) -> tuple[str, Path]:
+        store = store_or_404(graph_id)
+        try:
+            return cache.ensure(graph_id, store)
+        except Exception as exc:
+            raise HTTPException(500, f"graph {graph_id}: export to the parquet cache failed: {exc}")
 
     @app.middleware("http")
     async def audit(request: Request, call_next):
@@ -160,9 +201,73 @@ def create_app(
     async def get_one(graph_id: str):
         return load(store_or_404(graph_id))
 
+    # Sync handlers from here: they take a file lock or run an export, so
+    # they belong in the threadpool, not on the event loop.
     @app.put("/api/graphs/{graph_id}")
-    async def put_one(graph_id: str, graph: Graph):
+    def put_one(graph_id: str, graph: Graph):
         return save(store_or_404(graph_id), graph)
+
+    @app.post("/api/graphs/{graph_id}/ops")
+    def post_ops(graph_id: str, batch: OpBatch):
+        store = store_or_404(graph_id)
+        with store.locked():
+            before = fingerprint(store)
+            graph = Graph.model_validate(load(store))
+            try:
+                apply_ops(graph, batch.ops)
+                summary = store.save(graph)
+            except ValueError as exc:  # OpError, or validate_semantics in save
+                raise HTTPException(400, str(exc))
+            version = fingerprint(store)
+        sync_site()
+        moved = batch.base_version is not None and batch.base_version != before
+        return {"saved": True, "version": version, "moved": moved, **summary}
+
+    @app.get("/api/graphs/{graph_id}/version")
+    def graph_version(graph_id: str):
+        return JSONResponse({"version": fingerprint(store_or_404(graph_id))}, headers=NO_STORE)
+
+    # -- the static site's data URLs, served live from the parquet cache ------
+
+    @app.get("/data/graphs.json")
+    def data_graphs():
+        out = []
+        default = registry.default_id()
+        for gid in registry.stores():
+            _, vdir = cached(gid)
+            block = json.loads((vdir / "graph.json").read_text())
+            out.append(
+                {
+                    "id": gid,
+                    "nodes": block["store"]["nodes"],
+                    "edges": block["store"]["edges"],
+                    "views": len(block["views"]),
+                    "default": gid == default,
+                }
+            )
+        return JSONResponse({"graphs": out, "capabilities": CAPABILITIES}, headers=NO_STORE)
+
+    @app.get("/data/{graph_id}/graph.json")
+    def data_graph(graph_id: str):
+        version, vdir = cached(graph_id)
+        payload = json.loads((vdir / "graph.json").read_text())
+        # Point the parquet files at this version's immutable directory.
+        files = payload["store"]["files"]
+        payload["store"]["files"] = {k: f"{version}/{v}" for k, v in files.items()}
+        payload["version"] = version
+        return JSONResponse(payload, headers=NO_STORE)
+
+    # HEAD too: DuckDB-Wasm asks for the size before its range reads.
+    @app.api_route("/data/{graph_id}/{version}/{name}", methods=["GET", "HEAD"])
+    def data_file(graph_id: str, version: str, name: str):
+        if name not in DATA_FILES or not VERSION_RE.fullmatch(version):
+            raise HTTPException(404, f"no such data file: {version}/{name}")
+        cached(graph_id)  # keeps the cache current (and 404s unknown graphs)
+        path = cache.graph_root(graph_id, store_or_404(graph_id)) / version / name
+        if not path.is_file():
+            raise HTTPException(404, f"graph {graph_id} has no version {version} (reload)")
+        # Version dirs never change: cache hard.
+        return FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
     # The pre-multigraph API: unqualified means the default graph. Kept so
     # data repos pinning an older CLI against a newer server still work.
@@ -171,7 +276,7 @@ def create_app(
         return load(default_store())
 
     @app.put("/api/graph")
-    async def put_graph(graph: Graph):
+    def put_graph(graph: Graph):
         return save(default_store(), graph)
 
     @app.get("/api/selection")

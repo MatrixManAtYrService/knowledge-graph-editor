@@ -17,6 +17,8 @@ written via temp+rename; stale view files are removed.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -41,6 +43,19 @@ class GraphStore:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         os.replace(tmp, path)
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Exclusive lock for a load-modify-save, across threads and processes
+        (any writer of these files can take it: kge's ops, ekg's sync). flock
+        on the directory itself, so there is no lock file to gitignore."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # releases the lock
 
     # -- load / save ----------------------------------------------------------
 

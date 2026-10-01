@@ -1,18 +1,20 @@
-// Share-by-URL for the static read-only site: the location hash always
-// mirrors where the visitor is — graph, view, selection, and any deviation
+// Share-by-URL, in every mode: the location hash always mirrors where the
+// visitor is — graph, view, selection, and any deviation
 // from the saved view (foci, inclusion, eye adjustments) — so copying the
 // address bar shares exactly what they see. Nodes and edges are referenced
 // by their export integers (see static.ts), which are only stable until the
-// graph is edited: links may dangle across data pushes, by design.
+// graph is edited: links may dangle across data pushes, by design. In the
+// editor the hash is rewritten after every reload, so the address bar is
+// always good for the version on screen.
 //
 // Layout changes (drags, spacing actions, random layout) are deliberately
 // not encoded — positions are far too heavy for a URL. A shared link plays
 // the *saved* layout with the sender's visibility state on top.
 //
-// In windowed (parquet) mode this module also runs the data resolver: after
-// any change to what the view could show, ensureViewLoaded pulls the
-// missing sliver, and applying a hash first point-loads whatever integers
-// it names.
+// This module also runs the data resolver: after any change to what the
+// view could show, ensureViewLoaded pulls the missing sliver, and applying a
+// hash first point-loads whatever integers it names. And it notices when
+// the graph changed on the server (window focus → version check).
 //
 // Vocabulary (all parts optional except g/v; lists are comma-joined):
 //   g=<graphId>  v=<viewId>
@@ -23,9 +25,11 @@
 //   no=4,11  eo=2               per-item include overrides
 //   sh=n3,e7  hd=...            eye adjustments (summon / banish)
 
-import { ensureInts, ensureViewLoaded, staticGraph, WINDOWED_LOAD_CAP } from './static'
+import { fetchVersion } from './api'
+import { drainLoaded, ensureInts, ensureViewLoaded, staticGraph, WINDOWED_LOAD_CAP } from './static'
 import { useStore } from './store'
-import type { Focus, Sel, View } from './types'
+import type { EdgeT, Focus, NodeT, Sel, View } from './types'
+import { edgeKey } from './types'
 
 const sameList = (a: string[] | null | undefined, b: string[] | null | undefined): boolean => {
   if (a == null || b == null) return (a == null) === (b == null)
@@ -222,14 +226,32 @@ function paramInts(params: URLSearchParams): { nodes: number[]; edges: number[] 
   return { nodes, edges }
 }
 
-/** Republish the store's graph from the static payload (windowed loading
- * replaces the payload arrays; the store's shallow copies must follow). */
+const byNode = (a: NodeT, b: NodeT) =>
+  a.type < b.type ? -1 : a.type > b.type ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+const byEdge = (a: EdgeT, b: EdgeT) => {
+  const x = edgeKey(a)
+  const y = edgeKey(b)
+  return x < y ? -1 : x > y ? 1 : 0
+}
+
+/** Republish the store's graph, merging in rows the data layer loaded since
+ * last time. The store's graph is the editable copy: loads only add, never
+ * replace, and an edge whose endpoint was deleted locally stays out. */
 function publishGraph(): void {
-  const sg = staticGraph()
+  const fresh = drainLoaded()
   useStore.setState((s) => {
     if (!s.graph) return {}
-    const nodes = sg ? sg.payload.nodes : s.graph.nodes
-    const edges = sg ? sg.payload.edges : s.graph.edges
+    let { nodes, edges } = s.graph
+    if (fresh.nodes.length) {
+      const have = new Set(nodes.map((n) => n.id))
+      nodes = [...nodes, ...fresh.nodes.filter((n) => !have.has(n.id))].sort(byNode)
+    }
+    if (fresh.edges.length) {
+      const ids = new Set(nodes.map((n) => n.id))
+      const have = new Set(edges.map(edgeKey))
+      const add = fresh.edges.filter((e) => ids.has(e.from) && ids.has(e.to) && !have.has(edgeKey(e)))
+      edges = [...edges, ...add].sort(byEdge)
+    }
     return { graph: { ...s.graph, nodes, edges }, version: s.version + 1 }
   })
 }
@@ -339,6 +361,7 @@ async function resolveViewData(): Promise<void> {
       const view = g.views.find((x) => x.id === st.viewId) ?? g.views[0]
       if (!view) return
       const finger = JSON.stringify([
+        sg.generation, // a reload starts from nothing loaded
         st.graphId,
         view.id,
         view.foci,
@@ -355,13 +378,15 @@ async function resolveViewData(): Promise<void> {
           const res = await ensureViewLoaded(view)
           if (res.added) publishGraph()
           const t = sg.totals
-          if (t && (res.added || res.capped)) {
+          const n = sg.loaded()
+          if (t && res.capped) {
             st.setStatus(
-              res.capped
-                ? `this view asks for more than ${WINDOWED_LOAD_CAP} nodes — showing the first ` +
-                  `${sg.payload.nodes.length} of ${t.nodes}; focus a node or uncheck types to browse a sliver`
-                : `windowed: ${sg.payload.nodes.length} of ${t.nodes} nodes loaded ` +
-                  `(${sg.payload.edges.length} of ${t.edges} edges)`,
+              `this view asks for more than ${WINDOWED_LOAD_CAP} nodes — showing the first ` +
+                `${n.nodes} of ${t.nodes}; focus a node or uncheck types to browse a sliver`,
+            )
+          } else if (t && res.added && n.nodes < t.nodes) {
+            st.setStatus(
+              `windowed: ${n.nodes} of ${t.nodes} nodes loaded (${n.edges} of ${t.edges} edges)`,
             )
           }
         } catch (e) {
@@ -376,7 +401,31 @@ async function resolveViewData(): Promise<void> {
   }
 }
 
-/** Boot the static app: honor the incoming URL, then keep it current. */
+/** The graph changed on the server (an agent's edit, a sync, git pull):
+ * reload it where you are, or with unsaved edits, say so and let Refresh
+ * decide. */
+async function checkVersion(): Promise<void> {
+  const st = useStore.getState()
+  const sg = staticGraph()
+  if (!sg?.version || !st.caps.write || !st.graphId) return
+  let now: string
+  try {
+    now = await fetchVersion(st.graphId)
+  } catch {
+    return // server away: the next focus tries again
+  }
+  if (now === staticGraph()?.version) return
+  if (useStore.getState().dirty) {
+    st.setStatus('the graph changed on the server — Save to merge your edits in, or Refresh to drop them')
+    return
+  }
+  const { primary, secondary } = useStore.getState()
+  await useStore.getState().refresh()
+  useStore.setState({ primary, secondary })
+  useStore.getState().setStatus('the graph changed on the server — reloaded')
+}
+
+/** Boot the app: honor the incoming URL, then keep it current. */
 export async function initShare(): Promise<void> {
   const params = new URLSearchParams(window.location.hash.slice(1))
   const g = params.get('g')
@@ -401,6 +450,7 @@ export async function initShare(): Promise<void> {
   window.addEventListener('hashchange', () => {
     if (!applying) void applyFromLocation()
   })
+  window.addEventListener('focus', () => void checkVersion())
   await resolveViewData()
   writeHashNow()
 }

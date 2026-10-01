@@ -3,7 +3,8 @@
     uv run --with websockets python scripts/ui_timing.py http://localhost:8151/
     uv run --with websockets python scripts/ui_timing.py 'http://localhost:8152/#g=ebb&v=everything' --profile
 
-Loads the URL in a fresh browser profile and polls the status line until it
+Loads the URL in a fresh browser profile (with --warm: loads it once, then
+times a second load with the caches filled) and polls the status line until it
 reports a finished layout (or --until matches), printing elapsed time, the
 rendered node/edge counts and the status text. --profile records a CPU
 profile of the whole load and prints the top functions by inclusive and self
@@ -190,6 +191,12 @@ async def run(args) -> None:
             await cdp.call("Profiler.enable")
             await cdp.call("Profiler.setSamplingInterval", interval=500)
             await cdp.call("Profiler.start")
+        if args.warm:
+            # A first visit fills the HTTP and compiled-wasm caches; time the
+            # second, which is what a returning user sees.
+            await cdp.call("Page.navigate", url=args.url)
+            await wait_for_status(cdp, args.until, args.timeout)
+            await cdp.call("Page.navigate", url="about:blank")
         t0 = time.time()
         await cdp.call("Page.navigate", url=args.url)
         ok, state = await wait_for_status(cdp, args.until, args.timeout, t0)
@@ -215,6 +222,7 @@ def main() -> None:
     ap.add_argument("--until", default=r"^layout: ", help="status-line regex meaning 'ready'")
     ap.add_argument("--timeout", type=float, default=300, help="seconds before giving up")
     ap.add_argument("--profile", action="store_true", help="record and summarize a CPU profile")
+    ap.add_argument("--warm", action="store_true", help="load once first; time the second (cached) load")
     ap.add_argument("--resources", action="store_true", help="list network fetches, slowest first")
     ap.add_argument("--top", type=int, default=25)
     asyncio.run(run(ap.parse_args()))

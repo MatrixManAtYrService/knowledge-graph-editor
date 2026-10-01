@@ -1,7 +1,9 @@
-// Read-only static mode: the same app, but its data source is a directory
-// of files written by `kge export` (see src/kge/export.py) instead of the
-// kge server. The exported index.html sets window.KGE_STATIC before the app
-// module loads — that global is the whole mode switch.
+// The data layer: every graph is read the same way, whether from a directory
+// of files written by `kge export` (see src/kge/export.py) or from the live
+// server, which serves the same data/ URLs out of its parquet cache
+// (src/kge/cache.py). What differs is only what the source allows:
+// data/graphs.json lists `capabilities` (write, selection) — a live server
+// grants them, an export grants none.
 //
 // One data layout for every graph, whatever its size: graph.json carries
 // only schema, views, aggregate counts, and the skewer subgraph; nodes and
@@ -14,21 +16,28 @@
 // view names by id is point-read via the sorted ids sidecar.
 //
 // Every node/edge has an integer — its parquet row index — used by the
-// share URLs (share.ts) and the lazy detail lookups.
+// share URLs (share.ts) and the lazy detail lookups. Integers are only good
+// for one version of the data: after a save the graph reloads, and anything
+// held across it is held by id.
+//
+// The store's graph is the editable copy and the authority on what's in
+// it: loads only *add* rows it hasn't seen (drainLoaded → share.ts), so a
+// local delete stays deleted. `base` keeps each row as the server sent it;
+// ops.ts diffs the store against it to save.
 
 import { query, registerParquet, sqlStr } from './duck'
 import { SKEWER_EDGE, SKEWER_TYPE } from './graph'
 import type { EdgeT, GraphInfo, GraphPayload, NodeT, Sel, View } from './types'
 import { edgeKey } from './types'
 
-declare global {
-  interface Window {
-    KGE_STATIC?: boolean
-  }
+/** What the data source allows; absent = no (a static export grants nothing). */
+export interface Capabilities {
+  write?: boolean // edits can be saved (POST /api/graphs/{id}/ops)
+  selection?: boolean // the selection is published for agents (POST /api/selection)
 }
 
-export const STATIC_MODE: boolean =
-  typeof window !== 'undefined' && window.KGE_STATIC === true
+let caps: Capabilities = {}
+export const capabilities = (): Capabilities => caps
 
 interface StoreBlock {
   mode: 'parquet'
@@ -54,11 +63,14 @@ export interface StaticTotals {
   colors: Record<string, number>
 }
 
-/** Everything static mode knows about the currently loaded graph. */
+/** Everything the data layer knows about the currently loaded graph. */
 export interface StaticGraph {
   graphId: string
-  payload: GraphPayload // the live object the store holds (shared arrays)
-  pristine: GraphPayload // deep copy of the saved state, for URL diffing
+  version: string // the data version loaded ('' from an export)
+  generation: number // bumps on every (re)load, so watchers can tell
+  pristine: GraphPayload // the saved schema + views (nodes/edges: see base)
+  base: { nodes: Map<string, NodeT>; edges: Map<string, EdgeT> } // loaded rows as saved
+  loaded(): { nodes: number; edges: number }
   totals: StaticTotals // what exists in the data vs what's loaded
   nodeIdOf(i: number): string | undefined
   nodeTypeOf(i: number): string | undefined
@@ -81,9 +93,11 @@ interface WindowedState {
   adj: Map<number, AdjEntry[]>
   fullTypes: Set<string> // node types known to be fully loaded
   detail: { node: Set<number>; edge: Set<number> } // full-data fetches done
+  fresh: { nodes: NodeT[]; edges: EdgeT[] } // loaded but not yet handed to the store
 }
 
 let current: (StaticGraph & { windowed: WindowedState }) | null = null
+let generation = 0
 export const staticGraph = (): StaticGraph | null => current
 
 async function getJson(url: string): Promise<unknown> {
@@ -93,7 +107,8 @@ async function getJson(url: string): Promise<unknown> {
 }
 
 export async function staticFetchGraphs(): Promise<GraphInfo[]> {
-  const raw = (await getJson('data/graphs.json')) as { graphs: GraphInfo[] }
+  const raw = (await getJson('data/graphs.json')) as { graphs: GraphInfo[]; capabilities?: Capabilities }
+  caps = raw.capabilities ?? {}
   return raw.graphs
 }
 
@@ -102,6 +117,7 @@ export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
     schema: GraphPayload['schema']
     views: View[]
     store?: StoreBlock
+    version?: string
   }
   const block = raw.store
   if (!block || block.mode !== 'parquet') {
@@ -126,24 +142,16 @@ export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
     adj: new Map(),
     fullTypes: new Set(),
     detail: { node: new Set(), edge: new Set() },
+    fresh: { nodes: [], edges: [] },
   }
-  // The skewer subgraph rides in whole: rails, bundles, and spacing actions
-  // need every membership edge, and rails are curated (small).
-  for (const [key, node] of block.skewers.nodes) {
-    w.loadedNodes.set(key, node)
-    w.idByInt.set(key, node.id)
-    w.nodeIntById.set(node.id, key)
-  }
-  for (const [key, edge] of block.skewers.edges) {
-    w.loadedEdges.set(key, edge)
-    const k = edgeKey(edge)
-    w.keyByInt.set(key, k)
-    w.edgeIntByKey.set(k, key)
-  }
+  const base = { nodes: new Map<string, NodeT>(), edges: new Map<string, EdgeT>() }
   current = {
     graphId,
-    payload,
+    version: raw.version ?? '',
+    generation: ++generation,
     pristine: structuredClone(payload),
+    base,
+    loaded: () => ({ nodes: w.loadedNodes.size, edges: w.loadedEdges.size }),
     totals: {
       nodes: block.nodes,
       edges: block.edges,
@@ -158,8 +166,43 @@ export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
     intOfNode: (id) => w.nodeIntById.get(id),
     intOfEdge: (key) => w.edgeIntByKey.get(key),
   }
-  publishLoaded()
+  // The skewer subgraph rides in whole: rails, bundles, and spacing actions
+  // need every membership edge, and rails are curated (small).
+  for (const [key, node] of block.skewers.nodes) addNode(key, node)
+  for (const [key, edge] of block.skewers.edges) addEdge(key, edge)
+  const first = drainLoaded()
+  payload.nodes = first.nodes
+  payload.edges = first.edges
   return payload
+}
+
+/** Record a newly loaded row: indexed, snapshotted as saved, queued for the store. */
+function addNode(key: number, node: NodeT): void {
+  const w = current!.windowed
+  w.loadedNodes.set(key, node)
+  w.idByInt.set(key, node.id)
+  w.nodeIntById.set(node.id, key)
+  current!.base.nodes.set(node.id, structuredClone(node))
+  w.fresh.nodes.push(node)
+}
+
+function addEdge(key: number, edge: EdgeT): void {
+  const w = current!.windowed
+  w.loadedEdges.set(key, edge)
+  const k = edgeKey(edge)
+  w.keyByInt.set(key, k)
+  w.edgeIntByKey.set(k, key)
+  current!.base.edges.set(k, structuredClone(edge))
+  w.fresh.edges.push(edge)
+}
+
+/** Rows loaded since the last call, for the store to merge in (share.ts). */
+export function drainLoaded(): { nodes: NodeT[]; edges: EdgeT[] } {
+  const w = current?.windowed
+  if (!w) return { nodes: [], edges: [] }
+  const out = w.fresh
+  w.fresh = { nodes: [], edges: [] }
+  return out
 }
 
 // -- windowed loading ----------------------------------------------------------
@@ -181,15 +224,6 @@ const parseJson = (raw: unknown): Record<string, unknown> => {
   }
 }
 
-/** Rebuild the payload arrays from the loaded maps, in key order (the
- * export's (type, id) order, so sidebar item lists stay sorted). */
-function publishLoaded(): void {
-  const w = current?.windowed
-  if (!current || !w) return
-  current.payload.nodes = [...w.loadedNodes.entries()].sort((a, b) => a[0] - b[0]).map((x) => x[1])
-  current.payload.edges = [...w.loadedEdges.entries()].sort((a, b) => a[0] - b[0]).map((x) => x[1])
-}
-
 async function loadNodeRows(where: string): Promise<number> {
   const w = current!.windowed!
   await registerParquet(w.files.nodes)
@@ -206,9 +240,7 @@ async function loadNodeRows(where: string): Promise<number> {
       label: String(r.label ?? ''),
       data: parseJson(r.lite),
     }
-    w.loadedNodes.set(key, node)
-    w.idByInt.set(key, node.id)
-    w.nodeIntById.set(node.id, key)
+    addNode(key, node)
     w.adj.set(key, (parseJson(r.adj) as unknown as AdjEntry[]) ?? [])
     added++
   }
@@ -231,10 +263,7 @@ async function loadEdgeRows(where: string): Promise<number> {
       to: String(r.dst),
       data: parseJson(r.lite),
     }
-    w.loadedEdges.set(key, edge)
-    const k = edgeKey(edge)
-    w.keyByInt.set(key, k)
-    w.edgeIntByKey.set(k, key)
+    addEdge(key, edge)
     added++
   }
   return added
@@ -337,8 +366,8 @@ async function ensureEdgesByKeyStrings(keys: string[]): Promise<number> {
  * this before decoding a hash, so links into unloaded territory resolve). */
 export async function ensureInts(nodeInts: number[], edgeInts: number[]): Promise<void> {
   if (!current) return
-  const added = (await ensureNodesByInts(nodeInts)) + (await ensureEdgesByInts(edgeInts))
-  if (added) publishLoaded()
+  await ensureNodesByInts(nodeInts)
+  await ensureEdgesByInts(edgeInts)
 }
 
 /** Hard ceiling on nodes held in the browser at once: past this, the canvas
@@ -372,7 +401,7 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
   for (const id of [...(view.focusShow ?? []), ...(view.focusHide ?? [])]) {
     if (!id.includes('|')) ids.add(id)
   }
-  for (const e of sg.payload.edges) if (e.type === SKEWER_EDGE) ids.add(e.to) // rail members
+  for (const e of w.loadedEdges.values()) if (e.type === SKEWER_EDGE) ids.add(e.to) // rail members
   added += await ensureNodesByIds([...ids])
   added += await ensureEdgesByKeyStrings([
     ...(view.edgeOverrides ?? []),
@@ -432,7 +461,7 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
   } else {
     // Whole included types, largest-last, each only if it still fits: a
     // huge unfocused view yields a first slice and a hint, not a meltdown.
-    const types = Object.keys(sg.payload.schema.nodeTypes)
+    const types = Object.keys(sg.pristine.schema.nodeTypes)
       .filter((t) => t !== SKEWER_TYPE && nChecked(t))
       .sort((a, b) => (sg.totals?.nodeTypes[a] ?? 0) - (sg.totals?.nodeTypes[b] ?? 0))
     for (const t of types) {
@@ -459,15 +488,11 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
       const edge: EdgeT = outgoing
         ? { type: eType, from: node.id, to: other.id, data: {} }
         : { type: eType, from: other.id, to: node.id, data: {} }
-      w.loadedEdges.set(eInt, edge)
-      const k = edgeKey(edge)
-      w.keyByInt.set(eInt, k)
-      w.edgeIntByKey.set(k, eInt)
+      addEdge(eInt, edge)
       added++
     }
   }
 
-  if (added) publishLoaded()
   return { added: added > 0, capped }
 }
 
@@ -476,6 +501,7 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
 /** Pull one item's full `data` payload — a point read of the parquet `data`
  * column — and merge it into the live graph. Returns true when data changed. */
 export async function hydrateDetails(sel: Sel): Promise<boolean> {
+  if (sel.kind === 'skewer') return false // skewer rows ride in whole
   if (!current) return false
   const kind = sel.kind === 'edge' ? 'edge' : 'node'
   const w = current.windowed
@@ -491,6 +517,9 @@ export async function hydrateDetails(sel: Sel): Promise<boolean> {
     const target = kind === 'node' ? w.loadedNodes.get(int) : w.loadedEdges.get(int)
     if (!target) return false
     target.data = parseJson(raw)
+    // The full payload is what's saved, too: diff edits against it.
+    const saved = kind === 'node' ? current.base.nodes.get(sel.id) : current.base.edges.get(sel.id)
+    if (saved) saved.data = structuredClone(target.data)
     return true
   } catch {
     w.detail[kind].delete(int) // transient failure: allow a retry

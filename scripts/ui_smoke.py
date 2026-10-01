@@ -9,9 +9,12 @@ written) and starts its own servers:
 1. Live editor (`kge serve`): open `#g=<id>&v=<view>`, wait for the layout.
 2. Edit through the UI's store (window.__kgeStore, the same actions the
    buttons call): add a node next to one the view shows, connect them, set
-   data on the new node, save.
+   data on the new node, save (ops; the page reloads the graph after).
 3. Check the graph files on disk, reload the page, and check the edit
    survived: in the store, and on the canvas if the view showed it before.
+   Then edits around what the page never loaded: relabel a node without its
+   full data, delete one whose edges aren't all loaded, while an outside
+   writer edits a third — nothing unloaded or outside may be lost.
 4. Export the edited copy (`kge export`), serve it read-only, open the same
    view, and require the same rendered counts and the new node on canvas.
 
@@ -83,6 +86,10 @@ class Checks:
         return ok
 
 
+def read_list(path: Path, key: str) -> list[dict]:
+    return json.loads(path.read_text())[key]
+
+
 def page_errors(events: list) -> list[str]:
     out = []
     for m in events:
@@ -119,9 +126,17 @@ ON_CANVAS_JS = """(() => {
 })()"""
 
 
-async def on_canvas(cdp: Cdp, node: str, frm: str, to: str, etype: str) -> dict:
-    return await cdp.eval(ON_CANVAS_JS % {k: json.dumps(v) for k, v in
-                                          {"node": node, "from": frm, "to": to, "etype": etype}.items()})
+async def on_canvas(cdp: Cdp, node: str, frm: str, to: str, etype: str, settle: float = 5) -> dict:
+    """Whether the node and edge are drawn, polling up to `settle` seconds for
+    both (a save reloads the graph, and the canvas follows asynchronously)."""
+    js = ON_CANVAS_JS % {k: json.dumps(v) for k, v in
+                         {"node": node, "from": frm, "to": to, "etype": etype}.items()}
+    t0 = time.time()
+    while True:
+        r = await cdp.eval(js)
+        if (r["node"] and r["edge"]) or time.time() - t0 > settle:
+            return r
+        await asyncio.sleep(0.25)
 
 
 async def run(args) -> int:
@@ -178,18 +193,20 @@ async def run(args) -> int:
                 shown_before = await on_canvas(cdp, new_id, frm, to, etype)
                 check(shown_before["node"] and shown_before["edge"], "edit on canvas before reload")
 
-                nodes = json.loads((gdir / "nodes.json").read_text())
-                edges = json.loads((gdir / "edges.json").read_text())
-                nodes = nodes.get("nodes", nodes) if isinstance(nodes, dict) else nodes
-                edges = edges.get("edges", edges) if isinstance(edges, dict) else edges
+                nodes = read_list(gdir / "nodes.json", "nodes")
+                edges = read_list(gdir / "edges.json", "edges")
                 disk = next((n for n in nodes if n["id"] == new_id), None)
                 check(disk is not None and disk.get("data", {}).get("smoke") == token, "node + data on disk")
                 check(any(e["type"] == etype and e["from"] == frm and e["to"] == to for e in edges),
                       "edge on disk")
 
                 after = await open_view(cdp, base + hash_, args.timeout)
-                stored = await cdp.eval(f"""(() => {{
-                  const g = window.__kgeStore.getState().graph
+                # Loaded rows carry lite data only; pull the full payload the
+                # way the inspector does.
+                stored = await cdp.eval(f"""(async () => {{
+                  const S = window.__kgeStore
+                  await S.getState().hydrateSel({{ kind: 'node', id: {json.dumps(new_id)} }})
+                  const g = S.getState().graph
                   const n = g.nodes.find(n => n.id === {json.dumps(new_id)})
                   return {{ data: n ? n.data : null,
                            edge: g.edges.some(e => e.from === {json.dumps(frm)} && e.to === {json.dumps(to)}
@@ -203,6 +220,48 @@ async def run(args) -> int:
                     check(shown_after["edge"] == shown_before["edge"], "after reload: edge on canvas")
                 else:
                     print("  (the view hides the new node; canvas checks skipped)")
+
+                # Edits that must not lose anything the page never loaded:
+                # relabel a node without pulling its full data; meanwhile an
+                # outside writer (an agent, a sync) edits another node; then
+                # delete a third node whose edges aren't all loaded.
+                pick = await cdp.eval(f"""(() => {{
+                  const st = window.__kgeStore.getState()
+                  const cy = [...document.querySelectorAll('div')].find(d => d._cyreg)._cyreg.cy
+                  const shown = st.graph.nodes.filter(n => n.type !== 'skewer' && n.id !== {json.dumps(to)}
+                                                         && n.id !== {json.dumps(new_id)} && cy.getElementById(n.id).nonempty())
+                  return shown.length >= 2 ? [shown[0].id, shown[1].id] : null
+                }})()""")
+                if pick is None:
+                    print("  (fewer than 3 nodes shown; partial-load checks skipped)")
+                else:
+                    relabel, victim = pick
+                    disk_nodes = {n["id"]: n for n in read_list(gdir / "nodes.json", "nodes")}
+                    outsider = next(i for i in disk_nodes if i not in (relabel, victim, new_id, to))
+                    req = urllib.request.Request(
+                        f"{base}api/graphs/{graph_id}/ops", method="POST",
+                        headers={"Content-Type": "application/json"},
+                        data=json.dumps({"ops": [{"op": "patch_node", "id": outsider,
+                                                  "set": {"outside": token}}]}).encode())
+                    urllib.request.urlopen(req).read()
+                    await cdp.eval(f"""(async () => {{
+                      const S = window.__kgeStore
+                      S.getState().setNodeProps({json.dumps(relabel)}, {{ label: 'relabeled {token}' }})
+                      S.getState().deleteItems([{json.dumps(victim)}], [])
+                      await S.getState().save()
+                    }})()""")
+                    status = await cdp.eval("window.__kgeStore.getState().status")
+                    check("also changed" in status, f"save reports the outside change ({status})")
+                    nodes2 = {n["id"]: n for n in read_list(gdir / "nodes.json", "nodes")}
+                    edges2 = read_list(gdir / "edges.json", "edges")
+                    check(nodes2[relabel]["label"] == f"relabeled {token}"
+                          and nodes2[relabel]["data"] == disk_nodes[relabel]["data"],
+                          "relabel kept the node's unloaded data")
+                    check(nodes2.get(outsider, {}).get("data", {}).get("outside") == token,
+                          "outside writer's edit survived the save")
+                    check(victim not in nodes2 and not any(victim in (e["from"], e["to"]) for e in edges2),
+                          "delete removed the node and all its edges")
+                    after = await open_view(cdp, base + hash_, args.timeout)
                 live_counts = (after["nodes"], after["edges"])
 
             # -- static export ------------------------------------------------

@@ -20,7 +20,7 @@ import {
   visibleSets,
   type Skewer,
 } from './graph'
-import { STATIC_MODE, staticGraph } from './static'
+import { staticGraph } from './static'
 import { useStore } from './store'
 import type { Sel, TypeDef, View } from './types'
 import { edgeKey } from './types'
@@ -169,6 +169,7 @@ function Tree({
    * (the rows below list only the loaded sliver). */
   totals?: Record<string, number>
 }) {
+  const readOnly = !useStore((s) => s.caps.write)
   const {
     setTypesChecked,
     toggleOverride,
@@ -397,7 +398,7 @@ function Tree({
                           >
                             {item.label}
                           </span>
-                          {!STATIC_MODE && item.skewers && item.skewers.length > 0 && (
+                          {!readOnly && item.skewers && item.skewers.length > 0 && (
                             <button
                               className="row-btn"
                               title={`unskewer: remove from ${item.skewers.join(', ')} (the node stays)`}
@@ -408,7 +409,7 @@ function Tree({
                               ⊘
                             </button>
                           )}
-                          {!STATIC_MODE && (
+                          {!readOnly && (
                             <button
                               className="row-btn"
                               title={
@@ -444,6 +445,7 @@ function Tree({
  * with enable checkboxes — a disabled skewer keeps its members on canvas,
  * just not on a rail — and per-bundle presentation options. */
 function SkewerTree({ view, shownIds }: { view: View; shownIds: Set<string> }) {
+  const readOnly = !useStore((s) => s.caps.write)
   const graph = useStore((s) => s.graph)!
   const primary = useStore((s) => s.primary)
   const secondary = useStore((s) => s.secondary)
@@ -479,7 +481,7 @@ function SkewerTree({ view, shownIds }: { view: View; shownIds: Set<string> }) {
   const canNewSkewer =
     multiNodes.length >= 2 ||
     (primary?.kind === 'node' && secondary?.kind === 'node' && primary.id !== secondary.id)
-  const newSkewer = STATIC_MODE ? null : (
+  const newSkewer = readOnly ? null : (
     <div className="tree-tools">
       <button
         className="mini"
@@ -565,7 +567,7 @@ function SkewerTree({ view, shownIds }: { view: View; shownIds: Set<string> }) {
                         onChange={() => setEnabled([s], !skewerShown(view, s.id))}
                       />
                       <Eye state={shownIds.has(s.id) ? 'on' : 'off'} />
-                      {!STATIC_MODE && (
+                      {!readOnly && (
                         <button
                           className="row-btn row-btn-add"
                           disabled={!canAdd}
@@ -792,6 +794,7 @@ function ConnectRow() {
 }
 
 export function Sidebar() {
+  const readOnly = !useStore((s) => s.caps.write)
   const graph = useStore((s) => s.graph)
   const clickMode = useStore((s) => s.clickMode)
   const focusHops = useStore((s) => s.focusHops)
@@ -871,7 +874,7 @@ export function Sidebar() {
     <div className="sidebar">
       <div className="section">
         <h3>nodes</h3>
-        {!STATIC_MODE && <NewNodeForm />}
+        {!readOnly && <NewNodeForm />}
         <Tree
           kind="node"
           view={view}
@@ -883,7 +886,7 @@ export function Sidebar() {
 
       <div className="section">
         <h3>edges</h3>
-        {!STATIC_MODE && <ConnectRow />}
+        {!readOnly && <ConnectRow />}
         <Tree
           kind="edge"
           view={view}

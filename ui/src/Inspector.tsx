@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
 import { skewersOf } from './graph'
-import { STATIC_MODE } from './static'
 import { useStore } from './store'
 import type { Sel } from './types'
 import { edgeKey } from './types'
 
 function SkewerInspector({ skewerId }: { skewerId: string }) {
+  const readOnly = !useStore((s) => s.caps.write)
   const graph = useStore((s) => s.graph)!
   const skewer = skewersOf(graph).find((s) => s.id === skewerId)
   if (!skewer) return null
@@ -19,7 +19,7 @@ function SkewerInspector({ skewerId }: { skewerId: string }) {
           <li key={m}>{m}</li>
         ))}
       </ol>
-      {!STATIC_MODE && (
+      {!readOnly && (
         <div className="hint">
           Drag a member to move the skewer; drag an end handle to rotate or stretch it. Delete
           removes the skewer, not its members. Order lives in the graph (skewer-order edges) —
@@ -157,13 +157,23 @@ function EdgeInspector({ eKey }: { eKey: string }) {
   )
 }
 
-/** One selection slot — in the editor fully editable, on the static site a
- * read-only rendering of the same facts. */
+/** One selection slot — editable where the source allows writes, else a
+ * read-only rendering of the same facts. Either way the item's full data
+ * loads first (the canvas holds only lite fields); the editable forms wait
+ * for it, so "Apply data" can't save a partial copy over the real one. */
 function SlotSection({ slot, sel }: { slot: 'primary' | 'secondary'; sel: Sel }) {
+  const readOnly = !useStore((s) => s.caps.write)
   const hydrateSel = useStore((s) => s.hydrateSel)
+  const [hydrated, setHydrated] = useState('')
+  const selKey = `${sel.kind}:${sel.id}`
   useEffect(() => {
-    if (STATIC_MODE) void hydrateSel(sel)
-  }, [hydrateSel, sel, sel.kind, sel.id])
+    let live = true
+    void hydrateSel(sel).finally(() => live && setHydrated(selKey))
+    return () => {
+      live = false
+    }
+  }, [hydrateSel, sel, selKey])
+  const ready = hydrated === selKey
 
   return (
     <div className={`slot slot-${slot}`}>
@@ -171,16 +181,20 @@ function SlotSection({ slot, sel }: { slot: 'primary' | 'secondary'; sel: Sel })
         {slot} · {sel.kind}
       </h3>
       {sel.kind === 'node' &&
-        (STATIC_MODE ? (
+        (readOnly ? (
           <StaticNodeInspector key={sel.id} nodeId={sel.id} />
-        ) : (
+        ) : ready ? (
           <NodeInspector key={sel.id} nodeId={sel.id} />
+        ) : (
+          <div className="hint">loading data…</div>
         ))}
       {sel.kind === 'edge' &&
-        (STATIC_MODE ? (
+        (readOnly ? (
           <StaticEdgeInspector key={sel.id} eKey={sel.id} />
-        ) : (
+        ) : ready ? (
           <EdgeInspector key={sel.id} eKey={sel.id} />
+        ) : (
+          <div className="hint">loading data…</div>
         ))}
       {sel.kind === 'skewer' && <SkewerInspector key={sel.id} skewerId={sel.id} />}
     </div>
@@ -188,11 +202,12 @@ function SlotSection({ slot, sel }: { slot: 'primary' | 'secondary'; sel: Sel })
 }
 
 export function Inspector() {
+  const readOnly = !useStore((s) => s.caps.write)
   const primary = useStore((s) => s.primary)
   const secondary = useStore((s) => s.secondary)
   const multiNodes = useStore((s) => s.multiNodes)
 
-  if (multiNodes.length > 1 && !STATIC_MODE) {
+  if (multiNodes.length > 1 && !readOnly) {
     return (
       <div className="inspector">
         <h3>{multiNodes.length} nodes selected</h3>

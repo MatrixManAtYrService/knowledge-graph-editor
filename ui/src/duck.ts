@@ -2,8 +2,8 @@
 // page-open never pays the multi-MB wasm download, loaded from a pinned CDN
 // build, and given parquet files as HTTP-backed virtual files — a query like
 // `WHERE key IN (...)` then range-requests only the row groups whose min/max
-// stats cover those keys. This module is only reached in static windowed
-// mode (big graphs); the editor and inline-mode sites never import duckdb.
+// stats cover those keys. Every graph read goes through here, in the live
+// editor and on static exports alike (static.ts).
 
 // Pinned, known-good DuckDB-Wasm (avoids the withdrawn 1.3.3/1.29.2 builds).
 const DUCKDB_ESM = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm'

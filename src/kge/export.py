@@ -3,9 +3,8 @@
 `kge export` (or `kge serve --site-dir`) writes a directory that any static
 file host can serve:
 
-    <site>/index.html + assets/   the same built UI, with a marker script
-                                  injected so it boots in read-only mode
-    <site>/data/graphs.json       what GET /api/graphs returns
+    <site>/index.html + assets/   the same built UI
+    <site>/data/graphs.json       the graph list (no capabilities: read-only)
     <site>/data/<id>/graph.json   schema, views, and aggregate counts
     <site>/data/<id>/{nodes,edges,ids}.parquet   the graph itself
 
@@ -56,7 +55,6 @@ from kge.store import GraphRegistry
 # footer: row-group metadata is read up front, and at 200k rows it already
 # runs to hundreds of KB.
 ROW_GROUP = 1024
-STATIC_MARKER = "<script>window.KGE_STATIC = true</script>"
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -310,9 +308,8 @@ def export_data(registry: GraphRegistry, site_dir: Path) -> dict:
 
 
 def export_assets(ui_dir: Path, site_dir: Path) -> None:
-    """Copy the built UI into the site and mark it read-only: the injected
-    script sets window.KGE_STATIC before the app module loads, which is the
-    whole mode switch (see ui/src/static.ts)."""
+    """Copy the built UI into the site. It is read-only because data/graphs.json
+    grants no capabilities (and there is no API to write to); see ui/src/static.ts."""
     site_dir.mkdir(parents=True, exist_ok=True)
     assets_src = ui_dir / "assets"
     assets_dst = site_dir / "assets"
@@ -320,10 +317,7 @@ def export_assets(ui_dir: Path, site_dir: Path) -> None:
         shutil.rmtree(assets_dst)
     if assets_src.is_dir():
         shutil.copytree(assets_src, assets_dst)
-    html = (ui_dir / "index.html").read_text()
-    if STATIC_MARKER not in html:
-        html = html.replace("<script", f"{STATIC_MARKER}\n    <script", 1)
-    (site_dir / "index.html").write_text(html)
+    shutil.copyfile(ui_dir / "index.html", site_dir / "index.html")
     # GitHub Pages: no Jekyll pass over the exported files.
     (site_dir / ".nojekyll").write_text("")
 

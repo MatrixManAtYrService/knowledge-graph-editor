@@ -3,16 +3,17 @@
 // buffer transitions, and layout. Element creation and per-item actions
 // (nodes, edges, skewers, pins) live in the sidebar's sections.
 //
-// On the static read-only site (STATIC_MODE) the buffer transitions and
+// Where the data source grants no write capability (a static export) the
+// buffer transitions and
 // create/delete buttons disappear: the pickers and layout remain, and the
 // state a visitor navigates to lives in the URL instead of a Save.
 
 import { runLayout } from './GraphCanvas'
 import { fociOf } from './graph'
-import { STATIC_MODE } from './static'
 import { useStore } from './store'
 
 export function Toolbar() {
+  const readOnly = !useStore((s) => s.caps.write)
   const dirty = useStore((s) => s.dirty)
   const graph = useStore((s) => s.graph)
   const graphs = useStore((s) => s.graphs)
@@ -31,7 +32,7 @@ export function Toolbar() {
 
   const onPickGraph = (id: string) => {
     if (id === graphId) return
-    if (!STATIC_MODE && dirty && !window.confirm('Discard local edits and switch graphs?')) return
+    if (!readOnly && dirty && !window.confirm('Discard local edits and switch graphs?')) return
     setGraphId(id)
   }
 
@@ -82,7 +83,7 @@ export function Toolbar() {
               </option>
             ))}
           </select>
-          {!STATIC_MODE && (
+          {!readOnly && (
             <>
               <button className="mini-icon" onClick={onNewGraph} title="Seed a new empty graph on the server">
                 +
@@ -111,7 +112,7 @@ export function Toolbar() {
               </option>
             ))}
           </select>
-          {!STATIC_MODE && (
+          {!readOnly && (
             <>
               <button
                 className="mini-icon"
@@ -133,7 +134,7 @@ export function Toolbar() {
         </div>
       </div>
       <span className="sep" />
-      {STATIC_MODE ? (
+      {readOnly ? (
         <span
           className="ro-badge"
           title="A static, read-only copy of this graph. Focus, selection, and show/hide still work, and the URL always reflects what you see — copy it to share this exact view. Edits can't be saved."
