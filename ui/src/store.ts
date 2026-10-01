@@ -1,6 +1,8 @@
-// The browser's edit buffer: the whole graph payload, mutated locally,
-// pushed on Save, clobbered on Refresh. `version` bumps when the canvas
-// must rebuild its elements; position-only changes deliberately don't.
+// The browser's copy of the loaded part of the graph, edited in place: every
+// edit lands here at once and is saved as ops a moment later (share.ts),
+// which also swaps in new versions from the server. `version` bumps when
+// the canvas must rebuild its elements; position-only changes deliberately
+// don't.
 //
 // Selection is two-slot, Excel-style: every click becomes primary and the
 // old primary trails into secondary — so "the pair" is always the last two
@@ -244,9 +246,9 @@ export const useStore = create<KgeState>((set, get) => {
     setMultiNodes: (multiNodes) => set({ multiNodes }),
     setConnectEdgeType: (connectEdgeType) => set({ connectEdgeType }),
 
-    /** Switch graphs: drop the edit buffer and load the picked graph fresh
-     * (the caller confirms first when there are unsaved edits). The view
-     * picker re-buckets to the new graph's views inside refresh(). */
+    /** Switch graphs: load the picked graph fresh (the caller saves the
+     * current one's edits first). The view picker re-buckets to the new
+     * graph's views inside refresh(). */
     setGraphId: (graphId) => {
       set({ graphId, viewId: 'default', stashedFocus: null })
       void get().refresh()
@@ -273,7 +275,7 @@ export const useStore = create<KgeState>((set, get) => {
         // The current graph went away: refresh falls to the server default.
         await get().refresh()
       } else {
-        // Just re-list; don't clobber the edit buffer over a bystander.
+        // Just re-list; the graph on screen is untouched.
         try {
           set({ graphs: await fetchGraphs() })
         } catch {
@@ -300,7 +302,7 @@ export const useStore = create<KgeState>((set, get) => {
         g.views.push(clone)
       })
       get().setViewId(id)
-      set({ status: `created view ${id} (a copy of ${viewId}) — in this tab only until you Save` })
+      set({ status: `created view ${id} (a copy of ${viewId})` })
     },
 
     removeView: (id) => {

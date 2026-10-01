@@ -31,7 +31,9 @@ http.server does not:
 "Lite" node data is the fields rendering needs without a detail fetch: the
 schema's colorKey, every orderKey any skewer declares (so spacing actions
 work offline), and the whole payload for skewer nodes / skewer-order edges.
-The rest of an item's `data` loads when it is inspected.
+The rest of an item's `data` loads when it is inspected. The `data` column
+always holds an item's full data (NULL only when it has none), so it means
+the same thing to every reader — the browser's inspector and `kge sql`.
 
 Integers are stable only until the graph is edited — share links may dangle
 across data pushes, the accepted cost of not maintaining an id registry.
@@ -117,7 +119,7 @@ def export_graph_data(graph: Graph, out_dir: Path) -> dict:
     for i, n in enumerate(graph.nodes):
         lite = n.data if n.type == "skewer" else {k: v for k, v in n.data.items() if k in hot}
         nodes_lite.append({"id": n.id, "type": n.type, "label": n.label, "data": lite})
-        if any(k not in lite for k in n.data):
+        if n.data:
             node_detail[i] = n.data
 
     edges_lite: list[dict] = []
@@ -125,7 +127,7 @@ def export_graph_data(graph: Graph, out_dir: Path) -> dict:
     for i, e in enumerate(graph.edges):
         lite = e.data if e.type == "skewer-order" else {}
         edges_lite.append({"type": e.type, "from": e.src, "to": e.dst, "data": lite})
-        if any(k not in lite for k in e.data):
+        if e.data:
             edge_detail[i] = e.data
 
     base = {
@@ -190,7 +192,7 @@ def _write_windowed(
                 ("type", pa.large_string()),
                 ("label", pa.large_string()),
                 ("lite", pa.large_string()),
-                ("data", pa.large_string()),  # full data; NULL when lite covers it
+                ("data", pa.large_string()),  # full data; NULL when there is none
                 ("adj", pa.large_string()),
             ]
         ),

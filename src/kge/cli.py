@@ -10,6 +10,7 @@ Server resolution: --server > $KGE_SERVER_URL > http://localhost:8151.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -299,106 +300,98 @@ def _sql_prefix(graph_id: str) -> str:
     return re.sub(r"\W", "_", graph_id)
 
 
-def _export_conn(site: Path, graph: str):
-    """DuckDB over an exported site's parquet: <graph>_{nodes,edges,ids} per
-    graph, bare names for the default (or picked) graph."""
+SQL_TABLES = ("nodes", "edges", "ids")
+
+
+def _parquet_conn(files: dict[str, dict[str, Path]], bare: str):
+    """DuckDB views over each graph's parquet (export layout): <graph>_<table>
+    per graph, bare nodes/edges/ids for `bare`. The JSON columns are typed
+    JSON, so data->>'field' just works."""
     import duckdb
 
+    conn = duckdb.connect()
+
+    def register(view: str, path: Path, table: str) -> None:
+        src = "read_parquet('" + str(path).replace("'", "''") + "')"
+        cols = {"nodes": "lite, data, adj", "edges": "lite, data"}.get(table)
+        sel = f"* REPLACE ({', '.join(f'{c}::JSON AS {c}' for c in cols.split(', '))})" if cols else "*"
+        conn.execute(f'CREATE OR REPLACE VIEW "{view}" AS SELECT {sel} FROM {src}')
+
+    for gid, tables in files.items():
+        for t, path in tables.items():
+            register(f"{_sql_prefix(gid)}_{t}", path, t)
+    for t, path in files.get(bare, {}).items():
+        register(t, path, t)  # bare names last, so they win any collision
+    return conn
+
+
+def _pick_graph(entries: list[dict], graph: str, where: str) -> str:
+    if not entries:
+        raise _fail(f"{where} has no graphs")
+    ids = [g["id"] for g in entries]
+    if graph and graph not in ids:
+        raise _fail(f"no such graph in {where}: {graph} (available: {', '.join(ids)})")
+    return graph or next((g["id"] for g in entries if g.get("default")), ids[0])
+
+
+def _site_files(data_dir: Path, gid: str) -> dict[str, Path]:
+    """A graph's parquet files, as its graph.json names them (relative to data/<gid>/)."""
+    meta = json.loads((data_dir / gid / "graph.json").read_text())
+    names = (meta.get("store") or {}).get("files") or {t: f"{t}.parquet" for t in SQL_TABLES}
+    return {t: data_dir / gid / name for t, name in names.items() if (data_dir / gid / name).is_file()}
+
+
+def _export_conn(site: Path, graph: str):
+    """DuckDB over an exported site's parquet."""
     data_dir = site / "data"
     graphs_meta = data_dir / "graphs.json"
     if not graphs_meta.is_file():
         raise _fail(f"{site} is not an exported site (no data/graphs.json) — run: kge export --out {site}")
     entries = json.loads(graphs_meta.read_text()).get("graphs", [])
-    if not entries:
-        raise _fail("the export contains no graphs")
-    if graph and not any(g["id"] == graph for g in entries):
-        raise _fail(
-            f"no such graph in the export: {graph} (available: {', '.join(g['id'] for g in entries)})"
-        )
-    bare_gid = graph or next((g["id"] for g in entries if g.get("default")), entries[0]["id"])
-
-    conn = duckdb.connect()
-    tables = ("nodes", "edges", "ids")
-
-    def register(view: str, gid: str, table: str) -> None:
-        f = data_dir / gid / f"{table}.parquet"
-        if f.is_file():
-            path = str(f).replace("'", "''")
-            conn.execute(f'CREATE OR REPLACE VIEW "{view}" AS SELECT * FROM read_parquet(\'{path}\')')
-
-    for entry in entries:
-        prefix = _sql_prefix(entry["id"])
-        for t in tables:
-            register(f"{prefix}_{t}", entry["id"], t)
-    for t in tables:
-        register(t, bare_gid, t)  # bare names last, so they win any collision
-    return conn
+    bare = _pick_graph(entries, graph, "the export")
+    return _parquet_conn({e["id"]: _site_files(data_dir, e["id"]) for e in entries}, bare)
 
 
-def sql_connect_graphs(graphs: dict[str, Graph], bare: str):
-    """DuckDB over in-memory graphs: <graph>_{nodes,edges} per graph, bare
-    nodes/edges for `bare`. data is JSON; lite repeats it, so queries written
-    against an export (lite->>'field', COALESCE(data, lite)) run unchanged."""
-    import duckdb
-    import pyarrow as pa
+def _live_conn(server: str, graph: str, client: httpx.Client | None = None):
+    """DuckDB over the live server's graphs: the same parquet the browser
+    reads (the server's cache, kge.cache), downloaded into a local mirror.
+    Versions never change, so a repeat query downloads nothing."""
+    from kge.cache import default_root, prune_versions
 
-    conn = duckdb.connect()
-    raw = iter(range(1 << 30))
+    client = client or httpx.Client(base_url=server, timeout=60.0)
 
-    def register(prefix: str, g: Graph) -> None:
-        """Views <prefix>nodes / <prefix>edges over g."""
-        nodes = pa.table(
-            {
-                "id": [n.id for n in g.nodes],
-                "type": [n.type for n in g.nodes],
-                "label": [n.label for n in g.nodes],
-                "data": [json.dumps(n.data) for n in g.nodes],
-            }
-        )
-        edges = pa.table(
-            {
-                "type": [e.type for e in g.edges],
-                "src": [e.src for e in g.edges],
-                "dst": [e.dst for e in g.edges],
-                "data": [json.dumps(e.data) for e in g.edges],
-            }
-        )
-        i = next(raw)
-        conn.register(f"__raw_nodes_{i}", nodes)
-        conn.register(f"__raw_edges_{i}", edges)
-        conn.execute(
-            f'CREATE OR REPLACE VIEW "{prefix}nodes" AS SELECT id, type, label, '
-            f'data::JSON AS data, data::JSON AS lite FROM "__raw_nodes_{i}"'
-        )
-        conn.execute(
-            f'CREATE OR REPLACE VIEW "{prefix}edges" AS SELECT type, src, dst, '
-            f'data::JSON AS data, data::JSON AS lite FROM "__raw_edges_{i}"'
-        )
+    def get(path: str) -> httpx.Response:
+        try:
+            resp = client.get(path)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise _fail(
+                f"can't read {path} from the kge server at {server}: {exc} "
+                "(to query an export instead: kge sql --dir <site> ...)"
+            )
+        return resp
 
-    for gid, g in graphs.items():
-        register(_sql_prefix(gid) + "_", g)
-    if bare in graphs:
-        register("", graphs[bare])  # bare names last, so they win any collision
-    return conn
-
-
-def _live_conn(server: str, graph: str):
-    try:
-        resp = httpx.get(f"{server}/api/graphs", timeout=30.0)
-        resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise _fail(
-            f"can't reach the kge server at {server}: {exc} "
-            "(to query an export instead: kge sql --dir <site> ...)"
-        )
-    entries = resp.json().get("graphs", [])
-    if not entries:
-        raise _fail("the server offers no graphs")
-    ids = [e["id"] for e in entries]
-    if graph and graph not in ids:
-        raise _fail(f"no such graph: {graph} (available: {', '.join(ids)})")
-    bare = graph or next((e["id"] for e in entries if e.get("default")), ids[0])
-    return sql_connect_graphs({gid: _fetch(server, gid) for gid in ids}, bare)
+    entries = get("/data/graphs.json").json().get("graphs", [])
+    bare = _pick_graph(entries, graph, "the server")
+    mirror = default_root() / "remote" / hashlib.sha256(server.encode()).hexdigest()[:12]
+    files: dict[str, dict[str, Path]] = {}
+    for e in entries:
+        gid = e["id"]
+        meta = get(f"/data/{gid}/graph.json").json()
+        version = meta.get("version") or "unversioned"
+        vdir = mirror / gid / version
+        local: dict[str, Path] = {}
+        for table, name in meta["store"]["files"].items():
+            dest = vdir / Path(name).name
+            if not dest.is_file():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dest.with_suffix(".tmp")
+                tmp.write_bytes(get(f"/data/{gid}/{name}").content)
+                os.replace(tmp, dest)
+            local[table] = dest
+        files[gid] = local
+        prune_versions(mirror / gid, keep=vdir)
+    return _parquet_conn(files, bare)
 
 
 @app.command()
@@ -431,22 +424,21 @@ def sql(
 ) -> None:
     """Query graphs with DuckDB — the live server's, or an exported site's.
 
-    Every graph's tables are registered as <graph>_nodes, <graph>_edges
-    (non-word characters become underscores); the default graph — or the
-    one picked with --graph — also gets the bare names nodes, edges.
+    Both read the same parquet (live: the server's cache — what the
+    browser reads — mirrored under ~/.cache/kge/remote), so tables and
+    columns are identical. Every graph's tables are registered as
+    <graph>_nodes, <graph>_edges, <graph>_ids (non-word characters become
+    underscores); the default graph — or the one picked with --graph —
+    also gets the bare names nodes, edges, ids.
 
-    Live (default) columns:
-
-      nodes: id, type, label, data (JSON), lite (= data)
-      edges: type, src, dst, data (JSON), lite (= data)
-
-    Export (--dir) columns add the share-URL integers and adjacency:
-
-      nodes: key, id, type, label, lite (JSON hot fields),
-             data (full JSON; NULL when lite covers it), adj (JSON
-             adjacency: [edgeKey, otherKey, edgeType, otherType, outgoing])
-      edges: key, type, src, dst, src_key, dst_key, lite, data
+      nodes: key, id, type, label, data (JSON: the full data; NULL when
+             there is none), lite (JSON: the fields the browser draws
+             with), adj (JSON: \\[edgeKey, otherKey, edgeType, otherType,
+             outgoing] per incident edge)
+      edges: key, type, src, dst, src_key, dst_key, data, lite
       ids:   id -> key, sorted by id
+
+    key is the share-URL integer: good for one version of the graph only.
 
     For "exactly what does saved view X show", use `kge views X` — focus
     and eye resolution live there. For flow questions ("what does X
@@ -483,8 +475,9 @@ def sql(
 def onboarding() -> None:
     """How this tool works and how to collaborate with a human through it.
 
-    Read this first: it explains the editing model (whole-state save/refresh,
-    never merge), which state lives where, and what to tell your human user.
+    Read this first: it explains the editing model (per-item edits that save
+    themselves; nobody overwrites anybody), which state lives where, and how
+    to work alongside a human in the browser.
     """
     console.print("""\
 [bold]kge — the knowledge graph editor[/bold]
@@ -511,25 +504,34 @@ repo serves several, graph/ when it serves one)
                            skewer segments) — views belong to their graph
   server memory only       the human's current selection + graph + view
                            (transient, last-writer-wins; `kge selection`)
-  browser memory only      the human's UNSAVED edit buffer
+  browser memory only      at most a second of the human's edits, on their
+                           way to the server (they save themselves)
+  ~/.cache/kge/            derived, never committed: each graph as parquet
+                           (what the browser and `kge sql` read), refreshed
+                           whenever the files change; $KGE_CACHE_DIR moves it
   this CLI                 nothing — every command is stateless
   docs/ (if exported)      a static read-only mirror of the graphs as
                            parquet — regenerated on every save when the
                            server runs with --site-dir/$KGE_SITE_DIR, and
                            queryable with `kge sql` (see below)
 
-[bold]The editing model — clobber, never merge[/bold]
+[bold]The editing model — edits are operations; nobody clobbers anybody[/bold]
 
-  - The browser holds a full copy of the graph in memory. [bold]Save[/bold] pushes it
-    to the server (rewriting ALL the files); [bold]Refresh[/bold] replaces the browser
-    copy with the server's. There is no merging in either direction.
-  - This CLI is write-through: every edit command does GET -> mutate -> PUT
-    immediately. Your edits land in the files at once.
-  - Therefore: [bold]after you edit, tell the human to click Refresh[/bold] — until they
-    do, their browser shows stale data, and if they click Save first their
-    stale copy will overwrite your edits. Conversely, [bold]before you read or
-    edit, ask whether they have unsaved changes[/bold] (the Save button shows a *)
-    and have them Save first.
+  - Every edit, from the browser or this CLI, is an operation on one item
+    (add this node, patch that edge's data, replace this view's layout),
+    applied by the server to the files under a lock. Edits to different
+    items never overwrite each other; two edits to the same item: the last
+    one wins.
+  - The browser saves as it goes — a moment after each edit; there is no
+    Save button — and checks every few seconds for changes made elsewhere.
+    [bold]Your CLI edits show up in the human's browser on their own[/bold], and theirs
+    are in the files by the time you read them. No Save/Refresh to
+    coordinate.
+  - Anything that writes the files directly (ekg's sync, git pull, an
+    editor) is picked up the same way.
+  - The one exception: `kge load` replaces the WHOLE graph with a file
+    (clobber, never merge) — edits made since your `kge dump` are lost.
+    Prefer the per-item commands while a human is working.
 
 [bold]Getting the human started[/bold]
 
@@ -568,8 +570,8 @@ repo serves several, graph/ when it serves one)
     clicks) and current view — "what are they looking at" for questions
     about 'this' or 'these two'.
   - `kge find-collisions` reports what a selected object spatially overlaps
-    without being logically connected to (uses the view's saved geometry —
-    ask them to Save first if they've been dragging).
+    without being logically connected to (uses the view's saved geometry,
+    which trails their dragging by about a second).
 
 [bold]Following flow — reaches, reached-by, path[/bold]
 
@@ -583,28 +585,27 @@ repo serves several, graph/ when it serves one)
 
 [bold]Exploring with SQL — usually your cheapest read[/bold]
 
-  `kge sql "QUERY"` runs DuckDB over the live server's graphs (or over an
-  exported site with --dir docs). For anything beyond a single node —
-  counts, filters, joins, sweeps over data — this beats dumping the graph
-  and grepping, and it costs the context of one result set instead of the
-  whole payload:
+  `kge sql "QUERY"` runs DuckDB over the live server's graphs — the same
+  parquet the browser reads — or over an exported site with --dir docs.
+  For anything beyond a single node — counts, filters, joins, sweeps over
+  data — this beats dumping the graph and grepping, and it costs the
+  context of one result set instead of the whole payload:
 
     kge sql "SELECT type, count(*) FROM nodes GROUP BY 1"
     kge sql "SELECT id, label FROM nodes WHERE data->>'actor' = 'Jia Tan'"
     kge sql "SELECT src, dst FROM edges WHERE type = 'MERGED_AS'"
     kge sql -g other-graph -f json "SELECT ... "   # pick graph; json/csv out
 
-  Tables per graph: <graph>_nodes/_edges, with bare nodes/edges aliased to
-  the default (or -g) graph. Live columns: nodes(id, type, label, data),
-  edges(type, src, dst, data); data is JSON, and `lite` repeats it so
-  export-style queries run on both.
+  Tables per graph: <graph>_nodes/_edges/_ids, with bare nodes/edges/ids
+  aliased to the default (or -g) graph. Columns: nodes(key, id, type,
+  label, data, lite, adj), edges(key, type, src, dst, src_key, dst_key,
+  data, lite), ids(id, key). data is the item's full JSON (NULL when it has
+  none); lite is the few fields the browser draws with; adj lists a node's
+  edges as \\[edgeKey, otherKey, edgeType, otherType, outgoing]. key is the
+  integer share-URLs use — good for one version of the graph only.
 
-  Against an export (--dir): it is a MIRROR — re-export after editing (or
-  run the server with --site-dir so saves do it). It adds <graph>_ids and
-  columns: nodes.key (the integer share-URLs use), nodes.lite (the hot
-  fields only — the schema's colorKey, skewer orderKeys), nodes.data (NULL
-  when lite holds everything; COALESCE(data, lite) reads both), nodes.adj
-  (\\[edgeKey, otherKey, edgeType, otherType, outgoing]).
+  An export (--dir) is a MIRROR — re-export after editing (or run the
+  server with --site-dir so saves do it); same tables and columns.
 
   "What does saved view X show" belongs to `kge views X`, which applies the
   focus/eye resolution SQL doesn't know about.
@@ -617,8 +618,8 @@ repo serves several, graph/ when it serves one)
          skewer · load
 
   `kge dump > g.json`, edit, `kge load g.json` for bulk changes (whole-state
-  replace). After any edit: remind the human to Refresh. The files under
-  graph/ are ordinary git files — commit them like code.\
+  replace — see the exception above). The files under graph/ are ordinary
+  git files — commit them like code.\
 """)
 
 

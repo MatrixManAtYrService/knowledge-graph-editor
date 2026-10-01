@@ -354,7 +354,7 @@ export function boundValue(
 }
 
 /** The color a bound value wears: pinned by the schema, else a stable
- * palette pick (computable from the value alone — the static site's legend
+ * palette pick (computable from the value alone — the legend
  * uses this for values whose nodes aren't loaded). */
 export function valueColor(schema: GraphSchema, value: string): string {
   return schema.colorValues?.[value] ?? BIND_PALETTE[strHash(value) % BIND_PALETTE.length]

@@ -114,23 +114,25 @@ class ParquetCache:
                             raise
                 finally:
                     shutil.rmtree(tmp, ignore_errors=True)
-                self._prune(groot, keep=vdir)
+                prune_versions(groot, keep=vdir)
                 return version, vdir
         raise RuntimeError(f"graph {graph_id} kept changing during export; try again")
 
-    def _prune(self, groot: Path, keep: Path) -> None:
-        # Temp dirs a crashed export left behind (live ones are seconds old).
-        for d in groot.glob(".tmp-*"):
-            if time.time() - d.stat().st_mtime > 3600:
-                shutil.rmtree(d, ignore_errors=True)
-        versions = sorted(
-            (d for d in groot.iterdir() if d.is_dir() and not d.name.startswith(".")),
-            key=lambda d: d.stat().st_mtime,
-            reverse=True,
-        )
-        for d in versions[KEEP_VERSIONS:]:
-            if d != keep:
-                shutil.rmtree(d, ignore_errors=True)
+
+def prune_versions(groot: Path, keep: Path) -> None:
+    """Keep the newest KEEP_VERSIONS version dirs under `groot` (and `keep`)."""
+    # Temp dirs a crashed export left behind (live ones are seconds old).
+    for d in groot.glob(".tmp-*"):
+        if time.time() - d.stat().st_mtime > 3600:
+            shutil.rmtree(d, ignore_errors=True)
+    versions = sorted(
+        (d for d in groot.iterdir() if d.is_dir() and not d.name.startswith(".")),
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+    for d in versions[KEEP_VERSIONS:]:
+        if d != keep:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 # -- DuckDB-Wasm ---------------------------------------------------------------

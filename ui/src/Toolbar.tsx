@@ -1,13 +1,12 @@
 // The toolbar carries only whole-state concerns: which graph and view
 // you're on (with create/delete beside each picker), save state + Refresh,
 // and layout. Edits save themselves (share.ts); the indicator says where
-// that stands. Element creation and per-item actions
-// (nodes, edges, skewers, pins) live in the sidebar's sections.
+// that stands. Element creation and per-item actions (nodes, edges,
+// skewers, pins) live in the sidebar's sections.
 //
 // Where the data source grants no write capability (a static export) the
-// buffer transitions and
-// create/delete buttons disappear: the pickers and layout remain, and the
-// state a visitor navigates to lives in the URL instead of a Save.
+// save state and create/delete buttons disappear: the pickers and layout
+// remain, and the state a visitor navigates to lives in the URL.
 
 import { runLayout } from './GraphCanvas'
 import { fociOf } from './graph'

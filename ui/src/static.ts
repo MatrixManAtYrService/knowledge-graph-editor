@@ -549,7 +549,7 @@ export async function hydrateDetails(sel: Sel): Promise<boolean> {
     await registerParquet(file)
     const rows = await query(`SELECT data FROM '${file}' WHERE key = ${int}`)
     const raw = rows[0]?.data
-    if (typeof raw !== 'string' || !raw) return false // lite already covers it
+    if (typeof raw !== 'string' || !raw) return false // the item has no data
     const target = kind === 'node' ? w.loadedNodes.get(int) : w.loadedEdges.get(int)
     if (!target) return false
     target.data = parseJson(raw)

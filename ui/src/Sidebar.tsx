@@ -707,7 +707,7 @@ function ColorLegend() {
 }
 
 /** Node creation, in the nodes section: a toggle revealing type/id/label.
- * The node lands at the viewport center, selected, in the edit buffer. */
+ * The node lands at the viewport center, selected (and saves itself). */
 function NewNodeForm() {
   const graph = useStore((s) => s.graph)!
   const { addNode, setStatus } = useStore()

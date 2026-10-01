@@ -41,7 +41,15 @@ if it finds neither.
 
 A common setup has some other tool in your project, such as a scraper or a
 code analyzer, write `graphs/<name>/` directly. kge is there to view the
-result, curate it, and query it.
+result, curate it, and query it. It notices when the files change, whoever
+changed them, and an open browser picks up the change within a few seconds.
+
+kge keeps derived data out of your repo, under `~/.cache/kge` (set
+`KGE_CACHE_DIR` to move it): a parquet copy of each graph, which the browser
+and `kge sql` read, and the DuckDB-Wasm binary the browser runs, which the
+server downloads once from jsdelivr. On a network that can't reach jsdelivr,
+set `KGE_DUCKDB_WASM_SOURCE` to a mirror, as a URL template with `{version}`
+and `{name}`.
 
 ## Working with an agent
 
@@ -56,10 +64,11 @@ The CLI can do everything the UI does: add and remove nodes, edges, and types,
 list saved views, and dump or load the whole graph. `kge selection` tells the
 agent what you've clicked on, so you can ask about "this node" or "these two."
 
-Edits are never merged. Saving in the browser overwrites the files, and each
-CLI command writes straight through to them. When the agent makes a change,
-click **Refresh**. If you have unsaved work (the Save button shows `*`), click
-**Save** before the agent starts.
+You and the agent can edit at the same time. There's no Save button: the
+browser saves each edit a moment after you make it, and the agent's edits
+show up in your browser on their own. Each edit touches only its own node,
+edge, or view, so neither of you overwrites the other. The exception is
+`kge load`, which replaces the whole graph.
 
 ## What's in a graph
 
@@ -94,12 +103,13 @@ on GitHub Pages or any other static host. Visitors can browse, focus, and
 filter, and the URL updates as they go, so they can send a link to exactly
 what they're looking at. Data loads lazily, so even a very large graph opens
 quickly. Run `kge serve --site-dir docs` to regenerate the export every time
-you save.
+the graph changes.
 
-The export also works as a database:
+The graphs also work as a database, live or exported:
 
 ```bash
 kge sql "SELECT type, count(*) FROM nodes GROUP BY 1"
+kge sql --dir docs "SELECT id FROM nodes WHERE data->>'status' = 'open'"
 ```
 
 ## Developing kge
@@ -107,7 +117,7 @@ kge sql "SELECT type, count(*) FROM nodes GROUP BY 1"
 ```bash
 nix develop                     # uv, node, pnpm
 uv run kge serve                # backend + built UI on :8151
-cd ui && pnpm dev               # UI dev server on :5173, proxies /api to :8151
+cd ui && pnpm dev               # UI dev server on :5173, proxies /api, /data, /duckdb to :8151
 nix flake check
 ```
 
@@ -116,6 +126,13 @@ from git doesn't need a node toolchain. After you change the UI, refresh it:
 
 ```bash
 cd ui && pnpm build && rm -rf ../src/kge/ui_dist && cp -r dist ../src/kge/ui_dist
+```
+
+Browser checks, against any graph directory (they work on a temporary copy):
+
+```bash
+uv run --with websockets python scripts/ui_smoke.py graph            # correctness
+uv run --with websockets python scripts/ui_timing.py http://localhost:8151/ --warm
 ```
 
 `research-layout-persistence.md` has the background research behind the

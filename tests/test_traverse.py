@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from kge.cli import sql_connect_graphs
+from kge.cli import _live_conn
 from kge.models import Graph, TypeDef
 from kge.store import GraphStore
 from kge.traverse import paths, reach
@@ -99,12 +99,28 @@ def test_flow_on_node_type_is_rejected():
     assert any("edge types only" in e for e in g.validate_semantics())
 
 
-def test_sql_over_live_graphs():
-    conn = sql_connect_graphs({"ebb": make_graph(), "other-g": Graph()}, bare="ebb")
+def test_sql_over_live_graphs(tmp_path, monkeypatch):
+    """kge sql reads the server's parquet (what the browser reads), so live
+    and export queries see the same tables and columns."""
+    from fastapi.testclient import TestClient
+
+    from kge.cache import ParquetCache
+    from kge.server import create_app
+    from kge.store import GraphRegistry
+
+    monkeypatch.setenv("KGE_CACHE_DIR", str(tmp_path / "cache"))  # the CLI's download mirror
+    for gid, g in {"ebb": make_graph(), "other-g": Graph()}.items():
+        GraphStore(tmp_path / "graphs" / gid).save(g)
+    app = create_app(
+        GraphRegistry(dirs=[tmp_path / "graphs" / "ebb", tmp_path / "graphs" / "other-g"]),
+        cache=ParquetCache(tmp_path / "cache"),
+    )
+    conn = _live_conn("http://test", "", client=TestClient(app))
     assert conn.sql("SELECT count(*) FROM nodes").fetchone()[0] == 7
     assert conn.sql("SELECT count(*) FROM ebb_edges").fetchone()[0] == 6
     assert conn.sql("SELECT count(*) FROM other_g_nodes").fetchone()[0] == 0
     row = conn.sql("SELECT src, dst FROM edges WHERE data->>'per' = 'entity'").fetchone()
     assert row == ("handler:H", "table:db.t")
-    # lite mirrors data so export-style queries run unchanged.
-    assert conn.sql("SELECT count(*) FROM edges WHERE lite->>'note' = 'op.py:3'").fetchone()[0] == 1
+    # Export columns: integers, adjacency, the id sidecar.
+    assert conn.sql("SELECT count(*) FROM ids").fetchone()[0] == 7
+    assert conn.sql("SELECT json_array_length(adj) FROM nodes WHERE id = 'handler:H'").fetchone()[0] == 2
