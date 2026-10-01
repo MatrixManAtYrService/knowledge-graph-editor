@@ -751,12 +751,16 @@ const segsCross = (a1: Position, b1: Position, a2: Position, b2: Position): bool
  * (their counterpart takes the full displacement). Same-skewer edges are
  * skipped — they're drawn as arcs, not chords. Edges themselves are never
  * pushed; the offending node is moved off the segment instead.
+ *
+ * `deadline` (a performance.now() timestamp) caps the effort: past it, the
+ * solver stops after the current iteration and reports itself unsettled.
  */
 export function resolveCollisions(
   free: Record<string, Position>,
   pinnedNodes: Set<string>,
   rigs: Record<string, SkewerRig>,
   edges: { from: string; to: string }[],
+  deadline = Infinity,
 ): { free: Record<string, Position>; geoms: Record<string, SkewerGeom>; settled: boolean } {
   const freePos: Record<string, Position> = Object.fromEntries(
     Object.entries(free).map(([k, p]) => [k, { ...p }]),
@@ -775,6 +779,7 @@ export function resolveCollisions(
   let settled = false
   let lastHard = Infinity
   for (let iter = 0; iter < 60 && !settled; iter++) {
+    if (iter > 0 && performance.now() > deadline) break
     const pos: Record<string, Position> = { ...freePos }
     for (const [sid, r] of Object.entries(rigs)) {
       Object.assign(pos, placeAlong(geoms[sid], r.visMembers, r.ts))
@@ -1089,12 +1094,14 @@ export function resolveCollisions(
  * re-settle with resolveCollisions, and rescore — keep the step only while
  * the score doesn't get worse, stop as soon as it does (or shortening stalls).
  * Rigid rules as everywhere: members drag their skewer, pinned things stay.
+ * Past `deadline` (a performance.now() timestamp) it keeps what it has.
  */
 export function compactEdges(
   free: Record<string, Position>,
   pinnedNodes: Set<string>,
   rigs: Record<string, SkewerRig>,
   edges: { from: string; to: string }[],
+  deadline = Infinity,
 ): { free: Record<string, Position>; geoms: Record<string, SkewerGeom> } {
   const EDGE_IDEAL = 170 // matches fcose idealEdgeLength
   const PULL = 0.3
@@ -1133,6 +1140,7 @@ export function compactEdges(
   let curLen = totalLen(derive(curFree, curGeoms))
 
   for (let step = 0; step < 15; step++) {
+    if (performance.now() > deadline) break
     const pos = derive(curFree, curGeoms)
     const movable = (id: string): boolean => {
       const sid = memberOf.get(id)
@@ -1186,7 +1194,7 @@ export function compactEdges(
     }
 
     // Contraction may have caused overlaps: re-settle, then judge by score.
-    const res = resolveCollisions(candFree, pinnedNodes, rigsWith(candGeoms), edges)
+    const res = resolveCollisions(candFree, pinnedNodes, rigsWith(candGeoms), edges, deadline)
     const candScore = scoreArrangement(res.free, rigsWith(res.geoms), edges).score
     const candLen = totalLen(derive(res.free, res.geoms))
     if (candScore > curScore || candLen >= curLen - 1) break // hurts, or stalled: keep `cur`

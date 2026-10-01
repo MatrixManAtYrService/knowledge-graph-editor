@@ -466,8 +466,17 @@ function layoutLaneBundle(args: {
  * internally as equidistant lanes (see layoutLaneBundle) — run fcose on the
  * quotient graph from THREE random starts, de-collide each result, score them
  * (residual collisions, then crossings), and commit the best. Click again for
- * a new roll of the dice. */
+ * a new roll of the dice.
+ *
+ * The polishing (de-collision, compaction, scoring) is what costs: it compares
+ * pairs, so a few thousand nodes took minutes. It runs on a budget: once
+ * LAYOUT_BUDGET_MS has passed, every component still gets one fcose trial —
+ * so everything has a position — but nothing more is polished. A mess you can
+ * look at beats a frozen tab. */
+const LAYOUT_BUDGET_MS = 10_000
+
 export async function runLayout(): Promise<void> {
+  const deadline = performance.now() + LAYOUT_BUDGET_MS
   const st = useStore.getState()
   const g = st.graph
   const v = st.view()
@@ -613,6 +622,7 @@ export async function runLayout(): Promise<void> {
   }
 
   const TRIALS = 3
+  let fewestTrials = TRIALS // trials the budget let the least-lucky component run
   interface PieceResult {
     free: Record<string, Position>
     geoms: Record<string, SkewerGeom>
@@ -620,6 +630,7 @@ export async function runLayout(): Promise<void> {
     score: number
     collisions: number
     crossings: number
+    polished: boolean // false: the budget ran out first; collisions/crossings unknown
   }
 
   /** The best-of-N pipeline (fcose trial, quotient expansion, de-collision,
@@ -632,7 +643,9 @@ export async function runLayout(): Promise<void> {
     pEdges: { from: string; to: string }[],
   ): Promise<PieceResult> => {
     let best: PieceResult | null = null
-    for (let t = 0; t < TRIALS; t++) {
+    let t = 0
+    for (; t < TRIALS; t++) {
+      if (best && performance.now() > deadline) break // keep the best polished trial
       const positions = await runQuotientTrial(pEls, pFixed)
 
       // Expand the quotient: translate each skewer by its meta-node's movement,
@@ -689,16 +702,31 @@ export async function runLayout(): Promise<void> {
         }
       }
 
+      if (performance.now() > deadline) {
+        // Out of budget before any polishing: take fcose's arrangement as is.
+        best = {
+          free: positions,
+          geoms: Object.fromEntries(Object.entries(rigs).map(([sid, r]) => [sid, r.geom])),
+          settled: false,
+          score: Infinity,
+          collisions: 0,
+          crossings: 0,
+          polished: false,
+        }
+        t++
+        break
+      }
+
       // De-collide the real geometry, greedily shorten over-long edges while
       // the score tolerates it, then score the settled result.
-      const resolved = resolveCollisions(positions, pinnedNodes, rigs, pEdges)
+      const resolved = resolveCollisions(positions, pinnedNodes, rigs, pEdges, deadline)
       const resolvedRigs: Record<string, SkewerRig> = Object.fromEntries(
         Object.entries(rigs).map(([sid, r]) => [
           sid,
           { geom: resolved.geoms[sid], visMembers: r.visMembers, ts: r.ts },
         ]),
       )
-      const compacted = compactEdges(resolved.free, pinnedNodes, resolvedRigs, pEdges)
+      const compacted = compactEdges(resolved.free, pinnedNodes, resolvedRigs, pEdges, deadline)
       // De-collision and compaction can drift an aligned bundle: re-impose the
       // align contract against the reference rail, then re-snap the lanes to
       // the equidistant grid (order kept; a pinned rail anchors it).
@@ -723,9 +751,10 @@ export async function runLayout(): Promise<void> {
       )
       const sc = scoreArrangement(compacted.free, compactedRigs, pEdges)
       if (!best || sc.score < best.score) {
-        best = { free: compacted.free, geoms: compacted.geoms, settled: resolved.settled, ...sc }
+        best = { free: compacted.free, geoms: compacted.geoms, settled: resolved.settled, ...sc, polished: true }
       }
     }
+    fewestTrials = Math.min(fewestTrials, t)
     return best!
   }
 
@@ -753,6 +782,7 @@ export async function runLayout(): Promise<void> {
           score: 0,
           collisions: 0,
           crossings: 0,
+          polished: true,
         },
         anchored: pFixed.length > 0,
       })
@@ -858,6 +888,7 @@ export async function runLayout(): Promise<void> {
   let collisions = 0
   let crossings = 0
   let settled = true
+  let unpolished = 0
   pieces.forEach(({ result }, i) => {
     const d = shifts[i] ?? { x: 0, y: 0 }
     for (const [id, p] of Object.entries(result.free)) {
@@ -873,6 +904,7 @@ export async function runLayout(): Promise<void> {
     collisions += result.collisions
     crossings += result.crossings
     settled &&= result.settled
+    if (!result.polished) unpolished++
   })
 
   for (const [sid, geom] of Object.entries(allGeoms)) {
@@ -882,11 +914,16 @@ export async function runLayout(): Promise<void> {
   fitAfterBuild.flag = true
   st.bump()
   const noun = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`
+  const budgetHit = performance.now() > deadline
   st.setStatus(
-    `layout: best of ${TRIALS}` +
+    `layout: best of ${fewestTrials}` +
       (nComps > 1 ? ` × ${nComps} components, packed` : '') +
-      ` — ${noun(collisions, 'collision')}, ${noun(crossings, 'crossing')}` +
-      (settled ? '' : ' (not fully resolved)') +
+      (unpolished
+        ? ` — stopped polishing after ${LAYOUT_BUDGET_MS / 1000}s: ` +
+          `${noun(unpolished, 'component')} of ${pieces.length} left as fcose placed ` +
+          '(overlaps likely); hide some types to get a tidier layout'
+        : ` — ${noun(collisions, 'collision')}, ${noun(crossings, 'crossing')}` +
+          (settled ? '' : budgetHit ? ` (polishing cut short at ${LAYOUT_BUDGET_MS / 1000}s)` : ' (not fully resolved)')) +
       ' — click Layout again for a different roll',
   )
 }
