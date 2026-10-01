@@ -1,311 +1,122 @@
 # knowledge-graph-editor (kge)
 
-Knowledge graphs collaboratively edited by humans (browser UI) and agents
-(CLI). The source of truth is JSON files checked into this repo; a small
-server loads them and serves whole graphs to both kinds of client. One
-server can offer several graphs — the toolbar has a graph picker beside the
-view picker, and the CLI takes `--graph`/`-g` (or `$KGE_GRAPH`).
+A knowledge graph that lives in your repo as plain JSON files. You explore
+and edit it in a browser, and an agent can read and edit the same graph from
+the command line while you work. Because it's just files, you diff it, review
+it, and commit it like code.
 
-## Use it from your own repo (no clone, no node, no nix)
+It works well for things you're trying to understand piece by piece: how a
+codebase fits together, how a website's pages and APIs connect, how an
+incident unfolded. Your graph can come from a script, from an agent working
+through a problem with you, or from both.
 
-kge is consumable as a git dependency: your repo holds only your graph data,
-and the tool — server, CLI, *and* the browser UI, which is vendored into the
-Python package as static files — comes from GitHub. In your repo:
+## Try it
+
+The [demo repo](https://github.com/MatrixManAtYrService/knowledge-graph-editor-demo)
+has two example graphs, the xz-utils backdoor and the first ascents of the
+8000-meter peaks:
+
+```bash
+git clone https://github.com/MatrixManAtYrService/knowledge-graph-editor-demo
+cd knowledge-graph-editor-demo
+uv run kge serve        # then open http://localhost:8151
+```
+
+## Use it in your own project
+
+Add kge as a dependency. A dev dependency is usually enough:
 
 ```toml
 # pyproject.toml
-[project]
-name = "my-graph"
-version = "0.1.0"
-requires-python = ">=3.12"
-dependencies = ["kge"]
+[dependency-groups]
+dev = ["kge"]
 
 [tool.uv.sources]
 kge = { git = "https://github.com/MatrixManAtYrService/knowledge-graph-editor" }
 ```
 
-```bash
-uv run kge serve            # seeds ./graph if missing; UI at http://localhost:8151
-```
+Then run `uv run kge serve` from the repo root. kge serves every graph under
+`./graphs/<name>/`, or a single graph in `./graph/`, and creates an empty one
+if it finds neither.
 
-The only prerequisites are uv and Python 3.12+. See the
-[demo repo](https://github.com/MatrixManAtYrService/knowledge-graph-editor-demo)
-for a working example.
+A common setup has some other tool in your project, such as a scraper or a
+code analyzer, write `graphs/<name>/` directly. kge is there to view the
+result, curate it, and query it.
 
-## Developing kge itself
+## Working with an agent
 
-```bash
-nix develop                 # provides uv, node, pnpm
-uv run kge serve            # server + UI at http://localhost:8151
-```
-
-The UI is served from `ui/dist` (build it once with `cd ui && pnpm install &&
-pnpm build`; `nix build .#ui` builds it hermetically). Agents point the CLI at
-the server with `$KGE_SERVER_URL` or `--server` (default
-`http://localhost:8151`) and should start with:
+Point your agent at:
 
 ```bash
-uv run kge onboarding       # the collaboration model, for agents
-uv run kge --help           # every subcommand has its own --help
+uv run kge onboarding   # how the graph is stored and how to collaborate on it
+uv run kge --help       # every subcommand has its own --help
 ```
 
-## The editing model: clobber, never merge
+The CLI can do everything the UI does: add and remove nodes, edges, and types,
+list saved views, and dump or load the whole graph. `kge selection` tells the
+agent what you've clicked on, so you can ask about "this node" or "these two."
 
-- The **browser** holds a full copy of the graph in memory. **Save** pushes it
-  to the server, which rewrites the files under `graph/` (sorted,
-  pretty-printed — diff them, commit them). **Refresh** replaces the browser
-  copy with the server's. Nothing ever merges.
-- The **CLI** is write-through: every edit command fetches the graph, applies
-  the change, and puts it back immediately. It keeps no local state.
-- So the working rhythm is: one side edits, the other refreshes to see it.
-  After an agent edits, the human clicks Refresh; if the human has unsaved
-  work (the Save button shows `*`), they Save before the agent works.
-- The server is sessionless. Its only in-memory state is the shared
-  *selection* (see below) — everything else is the files.
+Edits are never merged. Saving in the browser overwrites the files, and each
+CLI command writes straight through to them. When the agent makes a change,
+click **Refresh**. If you have unsaved work (the Save button shows `*`), click
+**Save** before the agent starts.
 
-## Files
+## What's in a graph
 
-Each graph is one directory. `kge serve` with no options serves the
-subdirectories of `./graphs` if that exists (one graph per subdir, the
-subdir name is the graph id, rescanned per request so a new dir appears
-without a restart), else the single `./graph` directory (seeding it if
-missing). `--graph-dir` (repeatable) and `--graphs-dir` override; the first
-explicit dir — else `graphs/default`, else the alphabetically first — is the
-*default graph*, the one unqualified CLI commands and the pre-multigraph
-`/api/graph` endpoint mean. `kge add-graph <id>` (or the **+** beside the
-UI's graph picker) seeds a new empty graph under the root; `kge rm-graph`
-(or the **−**) deletes one — root-scanned graphs only, never the last one,
-and git history is the undo. Within a graph directory:
+```
+graphs/<name>/
+  schema.json     node and edge types: color, description, grouping
+  nodes.json      {id, type, label, data}
+  edges.json      {type, from, to, data}
+  views/*.json    saved views
+```
 
-- `schema.json` — node/edge type vocabulary: display color,
-  description, and `family` (the grouping level above type in the UI tree).
-  Optionally `colorKey`, a node-data field that binds node color: nodes
-  sharing a value of `data[colorKey]` share a color, overriding their type
-  color (whatever the field means to your data — an author, a component, a
-  status). `colorValues` pins colors for specific values; the rest get
-  stable palette picks. The sidebar shows the resulting legend. The binding
-  reaches rails too: a `skewer` node carrying the field tints its rail —
-  arrowhead, grip, and bulb in the exact legend color, base whitened
-  (pinned red still wins) — so a rail can visibly belong to its group.
-- `nodes.json`, `edges.json` — the graph, sorted for stable
-  diffs. Nodes: `{id, type, label, data}`. Edges: `{type, from, to, data}`
-  (by convention `data.note` carries `file:line` evidence).
-- `views/<id>.json` — one file per saved view (see Views). Views belong to
-  their graph: switching graphs in the UI swaps the view picker's entries.
+`data` holds any JSON you like. The files are sorted and pretty-printed so
+their diffs are readable.
 
-## Skewers
+A few ideas will help you find your way around the UI:
 
-The layout primitive is the **skewer** — an ordered colinearity group, like
-nodes on a shish-kebab spit:
+- **Views** are saved perspectives on a graph. Each one remembers which
+  types are shown, which nodes it's centered on (with a radius in hops),
+  and where everything sits on screen.
+- **Skewers** put nodes in a line, in order, like a timeline. A skewer is
+  part of the graph (`kge skewer my-timeline A B C`). Each view decides where
+  its rail is drawn. When several skewers share an ordering field such as a
+  date, the UI can line their rails up and space them on a shared scale.
+- **Color by field.** Setting `colorKey` in the schema colors nodes by a
+  field in their data, such as author, component, or status, so the color
+  isn't tied to node type.
 
-- **In the graph** (shared knowledge): a `skewer` node plus `skewer-order`
-  edges to its members, `data.index` giving the order. Agents create them
-  like any other fact: `kge skewer skewer:flow A B C`.
-- **In each view** (presentation): the segment the members sit on — two
-  endpoints (encoding position, angle, length) and a `pinned` flag.
+## Sharing it
 
-The UI never draws the raw skewer node. It renders a rail — a light→dark
-chain ending in an arrowhead, the name in a bulb at the base — that threads
-through its members *in order*, spacing them evenly along its straight
-baseline. A node rides at most one skewer — rails sharing members made a
-mess of the view, so adding a node to another skewer *moves* it (the UI's
-⊕, the CLI, and save-time validation all enforce this).
-Filtering compacts a rail instantly
-while preserving its order. Three drags do three things: drag the **rail**
-to move the whole skewer, drag an **end handle** to rotate or stretch the
-baseline, and drag a **member** to slide it along the rail — hand-placement
-that is baked like the spacing actions' output and clamped between its rail
-neighbors, so the stored order stays true. Edges between members of one
-skewer draw as arcs so they stay legible off the rail.
+`kge export` writes a read-only static copy of your graphs that you can host
+on GitHub Pages or any other static host. Visitors can browse, focus, and
+filter, and the URL updates as they go, so they can send a link to exactly
+what they're looking at. Data loads lazily, so even a very large graph opens
+quickly. Run `kge serve --site-dir docs` to regenerate the export every time
+you save.
 
-### Skewer bundles
-
-A skewer may declare `data.orderKey` — the member-data field its order
-reflects (a date, a version, any number: `kge skewer ... --order-key date`).
-Skewers sharing a key form a **bundle** (set `data.group` to split unrelated
-bundles that happen to share a key). The sidebar's **skewers** section lists
-bundles and lets you enable/disable rails singly or as a bundle — disabled
-rails release their members to float free, the nodes themselves stay — plus
-three per-bundle, per-view options:
-
-Below the rails sit two live constraints and a row of one-shot arrangement
-actions — apply one, then drag things wherever you like; changing course
-means applying a different action, not unchecking a box:
-
-- **align** (checkbox, live) — the bundle's rails share a direction and
-  their starts and ends stay colinear; dragging or stretching one rail
-  moves them all, each keeping only its sideways lane offset.
-- **group** (checkbox, live) — dragging any rail translates the whole
-  bundle rigidly, each rail keeping its own position, angle, and length:
-  the handle for repositioning a bundle without imposing alignment. Align
-  and group are mutually exclusive drag policies — checking one unchecks
-  the other. Pinned rails stay put in both modes.
-- **make equidistant** — snap the rails onto evenly spaced lanes, keeping
-  their order (a pinned rail anchors the grid).
-- **rotate 90°** — turn the whole bundle a quarter turn about its center.
-- **add padding** — stretch the rails just enough that neighboring dots and
-  labels stay clear of each other at the current member spacing (measured
-  from the actual label widths; under align the whole bundle takes the
-  worst-case stretch so the ends stay colinear).
-- **space evenly per skewer** — each rail spaces its own members evenly
-  along itself (the default placement).
-- **apply shared order** — members interleave across the bundle in one
-  merged ordering, evenly spaced: order carries across rails, durations
-  carry no weight. Works with any sortable value (strings included).
-- **apply proportional order** — members sit at their key value on one
-  scale shared by the whole bundle: durations are literal, a lull on one
-  rail (while activity ran elsewhere) is a visible gap, and a floating axis
-  labels the values at the ends and at round intervals between. Needs
-  values that parse as numbers or dates.
-
-The spacing actions bake per-member rail fractions into the view
-(`layout.memberFracs`); dragging and filtering never recompute them —
-re-apply an action (or "space evenly per skewer") to re-derive.
-
-## Views
-
-A view is a saved perspective on the same graph: pick one in the toolbar,
-clone or drop one with the **+** / **−** beside the picker (like graphs, a
-new view lives in your edit buffer until you Save). Node and edge creation
-sit atop the sidebar's nodes and edges sections (**new node**, and
-**connect**, which joins the secondary-selected node to the primary); each
-tree row carries micro-actions — a pushpin to pin/unpin nodes and skewers
-in place, **⊖** to delete the item from the graph, **⊘** to take a node off
-its skewers, and **⊕** on a skewer row to append the selected node. Each
-view stores:
-
-- **Inclusion** — the family → type → item tree in the sidebar. Checkboxes
-  at every level; checking/unchecking a parent clobbers the overrides
-  beneath it. This defines which data the view considers at all.
-- **Focus** — optional center nodes, each with a `focus-hops` radius; their
-  neighborhoods union. Click behavior picks what a node click does beyond
-  selecting: **refocus** makes the clicked node the only focus (a
-  "selection-walk": neighborhoods fade in/out and the viewport glides, and
-  eye adjustments reset); **add/remove focus** toggles — clicking a node
-  adds it as another center at the current `focus-hops`, clicking an
-  existing center (red crosshairs) removes that focus along with any
-  eye-summons within its reach, and nothing else is clobbered; **view/edit**
-  clicks around without touching the foci. The `focus-hops` box sets the
-  radius the next refocus/add uses — existing foci keep theirs. **Clear
-  focus** / **Restore focus** toggle the whole set.
-- **Eye adjustments** — the eye icons in the tree show what's actually on
-  canvas and are clickable: summon items the focus banished, or banish shown
-  ones, per item / type / family. Distinct from inclusion; cleared by the
-  next focus recenter. Peripheral nodes dim — the *frontier* of what's
-  shown, not a fixed band: summoning a distant node makes it the new dimmed
-  edge and undims the path to it; cycles through the center never dim.
-- **Layout** — node positions, skewer segments, pins.
-
-The sidebar legend identifies the markers: solid blue ring = primary
-selection, dotted grey ring = secondary, red crosshairs = focus center.
-
-## Layout
-
-**Random layout** runs three trials — fcose over a quotient graph in which
-each skewer is one long thin rigid node (and each **aligned bundle** is one
-rigid block), from three random starts — then
-de-collides each result (edges swing around obstacles by angle, nodes and
-rails separate, incident edges spread to share the full circle, over-long
-edges contract while the score tolerates it), scores them (collisions, then
-crossings), and shows the best. Click again to re-roll; pin what you like
-and re-roll the rest. Pinned nodes and skewers never move.
-
-Inside an aligned bundle the layout is lane-aware: rails sit equidistant,
-and their order is searched (a few shuffles per trial, scored by how many
-rails the bundle's own edges cross without terminating there), so heavily
-connected rails become neighbors. Free nodes that connect into the bundle
-are tried at every gap — outside the first rail, between each pair, outside
-the last — and take the gap whose edges cross the fewest rails, interleaving
-between the rails they connect (least-bad wins when zero crossings is
-impossible). Nodes with no edge into the bundle are kept out of the band
-entirely. A pinned rail anchors the whole grid.
-
-## Read-only static export
-
-`kge export` writes a self-contained static site (default `./site`) that any
-file host — GitHub Pages included — can serve: the same browser UI booted in
-read-only mode over exported JSON files. Editing is gone (no save, no
-create/delete), but everything perspectival works — views, focus walks,
-selection, the sidebar's include/eye toggles, even the layout actions — and
-the state a visitor navigates to is mirrored into the URL fragment, so the
-address bar is always a shareable deep link. A colleague can start from a
-saved view, modify what's shown, and send you *that*. Layout changes (drags,
-spacing actions) are the one thing not encoded — too heavy for a URL; a
-shared link plays the saved layout with the sender's visibility on top.
-
-URLs reference nodes and edges by their integer position in the exported
-arrays (`#g=xz-backdoor&v=default&p=n4&f=4.2` = primary-select node 4,
-focus on it at 2 hops), so links are stable only until the graph is edited
-and re-exported — dangling links after a data push are the accepted cost.
-
-The site also loads data lazily — one layout for every graph, whatever its
-size: nodes and edges ship as parquet files that the browser queries with
-DuckDB-Wasm over HTTP range requests (the ebb_profile_viz pattern), so a
-deep link downloads roughly what it shows. `graph.json` keeps only what
-must be whole — schema, views, per-type and per-color-value counts (the
-sidebar's totals), and the skewer subgraph. The saved view's focus resolves
-by BFS over a per-node adjacency column (whole 1024-row groups fetched as
-cacheable shards), an id→row sidecar makes by-name lookups prunable point
-reads, visible edges are synthesized from the adjacency entries without
-touching the edge table, and an item's full `data` is point-read when it is
-inspected. A 200k-node graph opens on a focused view for well under a
-megabyte of parquet traffic (plus the one-time ~6 MB DuckDB-Wasm engine,
-loaded from jsDelivr, pinned). The sidebar shows `loaded/total` counts per
-type, and a view that would exceed 4000 loaded nodes is capped with a
-status hint to focus or filter instead. Two caveats: the host must support
-HTTP Range requests (GitHub Pages does; `python -m http.server` does not —
-check an export locally with `kge serve --readonly --dir <dir>` instead,
-which serves exactly what visitors will get), and the skewer
-subgraph plus all rail members always load whole — rails are presentation
-for curated timelines, so keep them small relative to a huge graph. For a
-60-node demo graph the wasm engine is overkill, but one code path beats
-two.
-
-`kge serve --site-dir <dir>` (or `$KGE_SITE_DIR`) keeps an export current:
-the data files are regenerated after every save, so committing the site
-directory alongside the graph puts the shareable copy in the same push (the
-demo repo publishes its `docs/` this way).
-
-The export doubles as a queryable database: `kge sql` runs DuckDB over the
-parquet files, registering each graph as `<graph>_nodes` / `_edges` /
-`_ids` with bare `nodes`/`edges`/`ids` aliases for the default (or
-`--graph`-picked) one:
+The export also works as a database:
 
 ```bash
-kge sql "SELECT id, key FROM ids WHERE id LIKE 'peak:%'"   # share-URL ints
-kge sql -g xz-backdoor -f json "SELECT type, count(*) FROM nodes GROUP BY 1"
+kge sql "SELECT type, count(*) FROM nodes GROUP BY 1"
 ```
 
-Ad-hoc structure questions, integer lookups, sweeps over `data` — that's
-its lane; `kge views <id>` remains the authority on what a saved view
-shows (focus and eye resolution live there, not in SQL).
-
-## Selection is shared
-
-Every click publishes the two-slot selection (primary = latest click,
-secondary = the one before) and the current graph + view to the server. Agents read
-it with `kge selection` — "what is the human looking at" — and can answer
-questions about *this* node or *these two*. `kge find-collisions` reports
-what the selection spatially overlaps without being logically connected to;
-`kge views <id>` resolves a saved view to exactly what it shows.
-
-## Development
+## Developing kge
 
 ```bash
-nix develop
-uv run kge serve                 # backend + built UI
-cd ui && pnpm dev                # UI dev server on :5173, /api proxied to :8151
-nix build .#ui                   # hermetic UI build (native nixpkgs pnpm)
-nix flake check                  # build check
+nix develop                     # uv, node, pnpm
+uv run kge serve                # backend + built UI on :8151
+cd ui && pnpm dev               # UI dev server on :5173, proxies /api to :8151
+nix flake check
 ```
 
-After changing the UI, regenerate the vendored copy that git-dependency
-consumers receive (`src/kge/ui_dist/` is committed on purpose — pip/uv build
-the wheel straight from the git checkout, where no node toolchain exists):
+The built UI is committed under `src/kge/ui_dist/` so that installing kge
+from git doesn't need a node toolchain. After you change the UI, refresh it:
 
 ```bash
 cd ui && pnpm build && rm -rf ../src/kge/ui_dist && cp -r dist ../src/kge/ui_dist
 ```
 
-See `research-layout-persistence.md` for the prior-art survey behind the
-layout-persistence design.
+`research-layout-persistence.md` has the background research behind the
+layout design.
