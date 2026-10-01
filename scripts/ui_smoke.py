@@ -15,6 +15,10 @@ written) and starts its own servers:
    Then edits around what the page never loaded: relabel a node without its
    full data, delete one whose edges aren't all loaded, while an outside
    writer edits a third — nothing unloaded or outside may be lost.
+   Then stage-2 behavior: opening a view writes nothing; edits save
+   themselves; the canvas never blanks across a save; a drag and an agent's
+   `kge add-edge` at the same moment both survive; outside edits appear on
+   their own.
 4. Export the edited copy (`kge export`), serve it read-only, open the same
    view, and require the same rendered counts and the new node on canvas.
 
@@ -139,6 +143,100 @@ async def on_canvas(cdp: Cdp, node: str, frm: str, to: str, etype: str, settle: 
         await asyncio.sleep(0.25)
 
 
+SAVE_SETTLE = 1.5  # seconds: the UI's save debounce (0.7 s) plus a round trip
+
+
+async def wait_until(pred, timeout: float, step: float = 0.25):
+    """Poll an async predicate; its last value."""
+    t0 = time.time()
+    while True:
+        v = await pred()
+        if v or time.time() - t0 > timeout:
+            return v
+        await asyncio.sleep(step)
+
+
+MIN_NODES_JS = """(() => {
+  const cy = [...document.querySelectorAll('div')].find(d => d._cyreg)._cyreg.cy
+  window.__minNodes = cy.nodes().length
+  clearInterval(window.__minTimer)
+  window.__minTimer = setInterval(() => {
+    window.__minNodes = Math.min(window.__minNodes, cy.nodes().length)
+  }, 10)
+  return window.__minNodes
+})()"""
+
+
+async def stage2_checks(cdp: Cdp, check: Checks, base: str, graph_id: str, gdir: Path,
+                        args, token: str, hash_: str) -> None:
+    """Edits save themselves; reloads never blank the canvas; a human and an
+    agent editing at once both keep their edits; outside edits show up."""
+    st = lambda js: cdp.eval(f"window.__kgeStore.getState(){js}")  # noqa: E731
+    pick = await cdp.eval("""(() => {
+      const st = window.__kgeStore.getState()
+      const cy = [...document.querySelectorAll('div')].find(d => d._cyreg)._cyreg.cy
+      const shown = st.graph.nodes.filter(n => n.type !== 'skewer' && cy.getElementById(n.id).nonempty())
+      return shown.length >= 3 ? shown.slice(0, 3).map(n => n.id) : null
+    })()""")
+    if pick is None:
+        print("  (fewer than 3 nodes shown; autosave checks skipped)")
+        return
+    dragged, src, dst = pick
+
+    # 1. An edit saves itself: no save() call. And the canvas never blanks
+    # while it saves and reloads.
+    shown = await cdp.eval(MIN_NODES_JS)
+    await cdp.eval(f"window.__kgeStore.getState().setNodeProps({json.dumps(src)}, {{ label: 'auto {token}' }})")
+    on_disk = lambda: asyncio.sleep(0, result=any(  # noqa: E731
+        n["id"] == src and n["label"] == f"auto {token}" for n in read_list(gdir / "nodes.json", "nodes")))
+    check(await wait_until(on_disk, 4 * SAVE_SETTLE), "an edit saved itself")
+    check(await wait_until(lambda: st(".saving === false && !window.__kgeStore.getState().dirty"), 5),
+          "indicator settles to saved")
+    low = await cdp.eval("(clearInterval(window.__minTimer), window.__minNodes)")
+    check(low >= shown - 1, f"canvas never blanked during save + reload (min {low} of {shown} nodes)")
+
+    # 2. A drag (many position updates over ~2 s) while an agent adds an edge
+    # through the CLI mid-drag: both land.
+    etype = await st(".connectEdgeType")
+    cli = None
+    for i in range(16):
+        await cdp.eval(f"""(() => {{
+          const S = window.__kgeStore.getState()
+          const p = S.view().layout.seedPositions[{json.dumps(dragged)}] || {{ x: 0, y: 0 }}
+          S.setPositions({{ [{json.dumps(dragged)}]: {{ x: {1000 + i * 10}, y: {2000 + i * 5} }} }})
+        }})()""")
+        if i == 6:
+            cli = subprocess.Popen([*KGE, "add-edge", etype, dst, src, "--note", f"agent {token}",
+                                    "--server", base.rstrip("/"), "-g", graph_id],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        await asyncio.sleep(0.12)
+    out = cli.communicate(timeout=60)[0].decode() if cli else ""
+    check(cli is not None and cli.returncode == 0, f"agent's kge add-edge succeeded ({out.strip()[:80]})")
+
+    def both_on_disk():
+        view = json.loads((gdir / "views" / f"{args.view}.json").read_text())
+        pos = view["layout"]["seedPositions"].get(dragged)
+        edge = any(e["type"] == etype and e["from"] == dst and e["to"] == src
+                   and e["data"].get("note") == f"agent {token}"
+                   for e in read_list(gdir / "edges.json", "edges"))
+        return pos == {"x": 1150.0, "y": 2075.0}, edge
+    drag_ok = await wait_until(lambda: asyncio.sleep(0, result=both_on_disk()[0]), 4 * SAVE_SETTLE)
+    edge_ok = both_on_disk()[1]
+    check(bool(drag_ok), "the drag's final position saved")
+    check(edge_ok, "the agent's edge survived the drag's save")
+
+    # 3. An outside edit shows up in the open page by itself (version poll).
+    urllib.request.urlopen(urllib.request.Request(
+        f"{base}api/graphs/{graph_id}/ops", method="POST", headers={"Content-Type": "application/json"},
+        data=json.dumps({"ops": [{"op": "patch_node", "id": dragged, "label": f"outside {token}"}]}).encode(),
+    )).read()
+    seen = await wait_until(
+        lambda: cdp.eval(f"window.__kgeStore.getState().graph.nodes.some(n => n.label === 'outside {token}')"),
+        10,
+    )
+    check(bool(seen), "an outside edit appeared without a reload")
+
+
 async def run(args) -> int:
     check = Checks()
     src = Path(args.graph_dir).resolve()
@@ -154,7 +252,13 @@ async def run(args) -> int:
             # -- live editor -------------------------------------------------
             print(f"live: {graph_id} / {args.view}")
             with kge_server("--graph-dir", str(gdir)) as base:
+                view_file = gdir / "views" / f"{args.view}.json"
+                view_before = view_file.read_text() if view_file.is_file() else None
                 before = await open_view(cdp, base + hash_, args.timeout)
+                if before.get("drawn") != "saved":  # an automatic first layout ran
+                    await asyncio.sleep(2 * SAVE_SETTLE)
+                    check((view_file.read_text() if view_file.is_file() else None) == view_before,
+                          "opening a view (and its automatic layout) wrote nothing")
                 check(bool(before["nodes"]), f"view renders ({before['nodes']} nodes, {before['edges']} edges)")
                 # Anchor the new node on something the view shows, with its type
                 # and an edge type the schema has, so the edit lands in view.
@@ -251,7 +355,7 @@ async def run(args) -> int:
                       await S.getState().save()
                     }})()""")
                     status = await cdp.eval("window.__kgeStore.getState().status")
-                    check("also changed" in status, f"save reports the outside change ({status})")
+                    check("elsewhere" in status, f"save reports the outside change ({status})")
                     nodes2 = {n["id"]: n for n in read_list(gdir / "nodes.json", "nodes")}
                     edges2 = read_list(gdir / "edges.json", "edges")
                     check(nodes2[relabel]["label"] == f"relabeled {token}"
@@ -262,6 +366,8 @@ async def run(args) -> int:
                     check(victim not in nodes2 and not any(victim in (e["from"], e["to"]) for e in edges2),
                           "delete removed the node and all its edges")
                     after = await open_view(cdp, base + hash_, args.timeout)
+                await stage2_checks(cdp, check, base, graph_id, gdir, args, token, hash_)
+                after = await open_view(cdp, base + hash_, args.timeout)
                 live_counts = (after["nodes"], after["edges"])
 
             # -- static export ------------------------------------------------

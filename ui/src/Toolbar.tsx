@@ -1,6 +1,7 @@
 // The toolbar carries only whole-state concerns: which graph and view
-// you're on (with create/delete beside each picker), the Save/Refresh
-// buffer transitions, and layout. Element creation and per-item actions
+// you're on (with create/delete beside each picker), save state + Refresh,
+// and layout. Edits save themselves (share.ts); the indicator says where
+// that stands. Element creation and per-item actions
 // (nodes, edges, skewers, pins) live in the sidebar's sections.
 //
 // Where the data source grants no write capability (a static export) the
@@ -15,32 +16,27 @@ import { useStore } from './store'
 export function Toolbar() {
   const readOnly = !useStore((s) => s.caps.write)
   const dirty = useStore((s) => s.dirty)
+  const saving = useStore((s) => s.saving)
   const graph = useStore((s) => s.graph)
   const graphs = useStore((s) => s.graphs)
   const graphId = useStore((s) => s.graphId)
   const viewId = useStore((s) => s.viewId)
   const view = useStore((s) => s.view())
-  const { refresh, save, setGraphId, addGraph, removeGraph, setViewId, addView, removeView } =
+  const { reload, save, setGraphId, addGraph, removeGraph, setViewId, addView, removeView } =
     useStore()
 
   if (!graph || !view) return <div className="toolbar">loading…</div>
 
-  const onRefresh = () => {
-    if (dirty && !window.confirm('Discard local edits and refresh from the server?')) return
-    void refresh()
-  }
-
+  // Leaving this graph: send its unsaved edits first.
   const onPickGraph = (id: string) => {
     if (id === graphId) return
-    if (!readOnly && dirty && !window.confirm('Discard local edits and switch graphs?')) return
-    setGraphId(id)
+    void save().then(() => setGraphId(id))
   }
 
   const onNewGraph = () => {
     const id = window.prompt('new graph id (seeds an empty graph on the server)')
     if (!id) return
-    if (dirty && !window.confirm('Discard local edits and switch to the new graph?')) return
-    void addGraph(id.trim())
+    void save().then(() => addGraph(id.trim()))
   }
 
   const onDeleteGraph = () => {
@@ -55,7 +51,7 @@ export function Toolbar() {
   }
 
   const onNewView = () => {
-    const id = window.prompt('new view id (a copy of the current view; unsaved until you Save)')
+    const id = window.prompt('new view id (a copy of the current view)')
     if (id) addView(id.trim(), id.trim())
   }
 
@@ -117,7 +113,7 @@ export function Toolbar() {
               <button
                 className="mini-icon"
                 onClick={onNewView}
-                title="Create a new view as a copy of this one — it lives in your edit buffer until you Save"
+                title="Create a new view as a copy of this one"
               >
                 +
               </button>
@@ -143,10 +139,18 @@ export function Toolbar() {
         </span>
       ) : (
         <div className="tb-section">
-          <button className={dirty ? 'accent' : ''} onClick={() => void save()} disabled={!dirty}>
-            Save{dirty ? ' *' : ''}
+          <span
+            className={`save-state${dirty || saving ? ' pending' : ''}`}
+            title="Edits save themselves a moment after you make them"
+          >
+            {saving ? 'saving…' : dirty ? 'unsaved' : 'saved'}
+          </span>
+          <button
+            onClick={() => void reload()}
+            title="Pull in changes made elsewhere now (it also happens on its own every few seconds)"
+          >
+            Refresh
           </button>
-          <button onClick={onRefresh}>Refresh</button>
         </div>
       )}
       <span className="sep" />

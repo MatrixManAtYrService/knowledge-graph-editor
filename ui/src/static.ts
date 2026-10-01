@@ -96,7 +96,15 @@ interface WindowedState {
   fresh: { nodes: NodeT[]; edges: EdgeT[] } // loaded but not yet handed to the store
 }
 
-let current: (StaticGraph & { windowed: WindowedState }) | null = null
+/** One loaded version of a graph. A reload builds a new one in the
+ * background and only then makes it current (share.ts), so the canvas
+ * never sees a half-loaded graph. */
+export type Loaded = StaticGraph & {
+  windowed: WindowedState
+  payload: GraphPayload // schema, views, and the rows loaded with them
+}
+
+let current: Loaded | null = null
 let generation = 0
 export const staticGraph = (): StaticGraph | null => current
 
@@ -117,7 +125,19 @@ export async function staticFetchGraphs(): Promise<GraphInfo[]> {
   return raw.graphs
 }
 
+/** Load and activate: what a plain (re)load does. */
 export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
+  const sg = await loadGraph(graphId)
+  activate(sg)
+  return sg.payload
+}
+
+export function activate(sg: Loaded): void {
+  current = sg
+}
+
+/** Fetch a graph's current version, without making it current. */
+export async function loadGraph(graphId: string): Promise<Loaded> {
   const raw = (await getJson(`data/${encodeURIComponent(graphId)}/graph.json`)) as {
     schema: GraphPayload['schema']
     views: View[]
@@ -150,8 +170,9 @@ export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
     fresh: { nodes: [], edges: [] },
   }
   const base = { nodes: new Map<string, NodeT>(), edges: new Map<string, EdgeT>() }
-  current = {
+  const sg: Loaded = {
     graphId,
+    payload,
     version: raw.version ?? '',
     generation: ++generation,
     pristine: structuredClone(payload),
@@ -173,37 +194,37 @@ export async function staticFetchGraph(graphId: string): Promise<GraphPayload> {
   }
   // The skewer subgraph rides in whole: rails, bundles, and spacing actions
   // need every membership edge, and rails are curated (small).
-  for (const [key, node] of block.skewers.nodes) addNode(key, node)
-  for (const [key, edge] of block.skewers.edges) addEdge(key, edge)
-  const first = drainLoaded()
+  for (const [key, node] of block.skewers.nodes) addNode(sg, key, node)
+  for (const [key, edge] of block.skewers.edges) addEdge(sg, key, edge)
+  const first = drainLoaded(sg)
   payload.nodes = first.nodes
   payload.edges = first.edges
-  return payload
+  return sg
 }
 
 /** Record a newly loaded row: indexed, snapshotted as saved, queued for the store. */
-function addNode(key: number, node: NodeT): void {
-  const w = current!.windowed
+function addNode(sg: Loaded, key: number, node: NodeT): void {
+  const w = sg.windowed
   w.loadedNodes.set(key, node)
   w.idByInt.set(key, node.id)
   w.nodeIntById.set(node.id, key)
-  current!.base.nodes.set(node.id, structuredClone(node))
+  sg.base.nodes.set(node.id, structuredClone(node))
   w.fresh.nodes.push(node)
 }
 
-function addEdge(key: number, edge: EdgeT): void {
-  const w = current!.windowed
+function addEdge(sg: Loaded, key: number, edge: EdgeT): void {
+  const w = sg.windowed
   w.loadedEdges.set(key, edge)
   const k = edgeKey(edge)
   w.keyByInt.set(key, k)
   w.edgeIntByKey.set(k, key)
-  current!.base.edges.set(k, structuredClone(edge))
+  sg.base.edges.set(k, structuredClone(edge))
   w.fresh.edges.push(edge)
 }
 
 /** Rows loaded since the last call, for the store to merge in (share.ts). */
-export function drainLoaded(): { nodes: NodeT[]; edges: EdgeT[] } {
-  const w = current?.windowed
+export function drainLoaded(sg: Loaded | null = current): { nodes: NodeT[]; edges: EdgeT[] } {
+  const w = sg?.windowed
   if (!w) return { nodes: [], edges: [] }
   const out = w.fresh
   w.fresh = { nodes: [], edges: [] }
@@ -229,8 +250,8 @@ const parseJson = (raw: unknown): Record<string, unknown> => {
   }
 }
 
-async function loadNodeRows(where: string): Promise<number> {
-  const w = current!.windowed!
+async function loadNodeRows(sg: Loaded, where: string): Promise<number> {
+  const w = sg.windowed
   await registerParquet(w.files.nodes)
   const rows = await query(
     `SELECT key, id, type, label, lite, adj FROM '${w.files.nodes}' WHERE ${where}`,
@@ -245,15 +266,15 @@ async function loadNodeRows(where: string): Promise<number> {
       label: String(r.label ?? ''),
       data: parseJson(r.lite),
     }
-    addNode(key, node)
+    addNode(sg, key, node)
     w.adj.set(key, (parseJson(r.adj) as unknown as AdjEntry[]) ?? [])
     added++
   }
   return added
 }
 
-async function loadEdgeRows(where: string): Promise<number> {
-  const w = current!.windowed!
+async function loadEdgeRows(sg: Loaded, where: string): Promise<number> {
+  const w = sg.windowed
   await registerParquet(w.files.edges)
   const rows = await query(
     `SELECT key, type, src, dst, lite FROM '${w.files.edges}' WHERE ${where}`,
@@ -268,7 +289,7 @@ async function loadEdgeRows(where: string): Promise<number> {
       to: String(r.dst),
       data: parseJson(r.lite),
     }
-    addEdge(key, edge)
+    addEdge(sg, key, edge)
     added++
   }
   return added
@@ -279,26 +300,26 @@ async function loadEdgeRows(where: string): Promise<number> {
  * stats — `key IN (...)` does not, and scans the whole file. So integer
  * lookups load whole 256-row groups with BETWEEN (each group is a tight,
  * cacheable shard; its neighbors ride along for free). */
-async function ensureNodeGroups(groupIds: Iterable<number>): Promise<number> {
-  const w = current!.windowed!
+async function ensureNodeGroups(sg: Loaded, groupIds: Iterable<number>): Promise<number> {
+  const w = sg.windowed
   let added = 0
   for (const g of groupIds) {
     if (w.nodeGroups.has(g)) continue
     w.nodeGroups.add(g)
     const lo = g * w.rowGroup
-    added += await loadNodeRows(`key BETWEEN ${lo} AND ${lo + w.rowGroup - 1}`)
+    added += await loadNodeRows(sg, `key BETWEEN ${lo} AND ${lo + w.rowGroup - 1}`)
   }
   return added
 }
 
-async function ensureNodesByInts(ints: number[]): Promise<number> {
-  const w = current!.windowed!
+async function ensureNodesByInts(sg: Loaded, ints: number[]): Promise<number> {
+  const w = sg.windowed
   const groups = new Set(ints.filter((i) => !w.loadedNodes.has(i)).map((i) => Math.floor(i / w.rowGroup)))
-  return ensureNodeGroups(groups)
+  return ensureNodeGroups(sg, groups)
 }
 
-async function ensureNodesByIds(ids: string[]): Promise<number> {
-  const w = current!.windowed!
+async function ensureNodesByIds(sg: Loaded, ids: string[]): Promise<number> {
+  const w = sg.windowed
   const missing = [...new Set(ids.filter((id) => !w.nodeIntById.has(id)))].sort()
   if (!missing.length) return 0
   // Two-step via the id->key sidecar (sorted by id). Equality probes prune;
@@ -321,46 +342,46 @@ async function ensureNodesByIds(ids: string[]): Promise<number> {
         for (const r of rows) if (wanted.has(String(r.id))) keys.push(Number(r.key))
       }
     }
-    return ensureNodesByInts(keys)
+    return ensureNodesByInts(sg, keys)
   }
   let added = 0
-  for (const id of missing) added += await loadNodeRows(`id = ${sqlStr(id)}`)
+  for (const id of missing) added += await loadNodeRows(sg, `id = ${sqlStr(id)}`)
   return added
 }
 
-async function ensureNodesByTypes(types: string[]): Promise<number> {
-  const w = current!.windowed!
+async function ensureNodesByTypes(sg: Loaded, types: string[]): Promise<number> {
+  const w = sg.windowed
   let added = 0
   // Per-type equality: pushes down, and the (type, id) sort makes each type
   // one contiguous, prunable span of row groups.
   for (const t of types) {
-    if (w.fullTypes.has(t) || (current!.totals?.nodeTypes[t] ?? 0) === 0) continue
-    added += await loadNodeRows(`type = ${sqlStr(t)}`)
+    if (w.fullTypes.has(t) || (sg.totals?.nodeTypes[t] ?? 0) === 0) continue
+    added += await loadNodeRows(sg, `type = ${sqlStr(t)}`)
     w.fullTypes.add(t)
   }
   return added
 }
 
-async function ensureEdgesByInts(ints: number[]): Promise<number> {
-  const w = current!.windowed!
+async function ensureEdgesByInts(sg: Loaded, ints: number[]): Promise<number> {
+  const w = sg.windowed
   const groups = new Set(ints.filter((i) => !w.loadedEdges.has(i)).map((i) => Math.floor(i / w.rowGroup)))
   let added = 0
   for (const g of groups) {
     if (w.edgeGroups.has(g)) continue
     w.edgeGroups.add(g)
     const lo = g * w.rowGroup
-    added += await loadEdgeRows(`key BETWEEN ${lo} AND ${lo + w.rowGroup - 1}`)
+    added += await loadEdgeRows(sg, `key BETWEEN ${lo} AND ${lo + w.rowGroup - 1}`)
   }
   return added
 }
 
-async function ensureEdgesByKeyStrings(keys: string[]): Promise<number> {
-  const w = current!.windowed!
+async function ensureEdgesByKeyStrings(sg: Loaded, keys: string[]): Promise<number> {
+  const w = sg.windowed
   const missing = keys.filter((k) => !w.edgeIntByKey.has(k) && k.split('|').length === 3)
   let added = 0
   for (const k of missing) {
     const [type, src, dst] = k.split('|')
-    added += await loadEdgeRows(
+    added += await loadEdgeRows(sg, 
       `type = ${sqlStr(type)} AND src = ${sqlStr(src)} AND dst = ${sqlStr(dst)}`,
     )
   }
@@ -369,10 +390,21 @@ async function ensureEdgesByKeyStrings(keys: string[]): Promise<number> {
 
 /** Point-load nodes/edges referenced by share-URL integers (share.ts calls
  * this before decoding a hash, so links into unloaded territory resolve). */
-export async function ensureInts(nodeInts: number[], edgeInts: number[]): Promise<void> {
-  if (!current) return
-  await ensureNodesByInts(nodeInts)
-  await ensureEdgesByInts(edgeInts)
+export async function ensureInts(
+  nodeInts: number[],
+  edgeInts: number[],
+  sg: Loaded | null = current,
+): Promise<void> {
+  if (!sg) return
+  await ensureNodesByInts(sg, nodeInts)
+  await ensureEdgesByInts(sg, edgeInts)
+}
+
+/** Point-load nodes by id (and edges by edgeKey) — e.g. whatever pending
+ * local edits touch, before replaying them onto a reloaded graph. */
+export async function ensureIds(nodeIds: string[], edgeKeys: string[], sg: Loaded): Promise<void> {
+  await ensureNodesByIds(sg, nodeIds)
+  await ensureEdgesByKeyStrings(sg, edgeKeys)
 }
 
 /** Hard ceiling on nodes held in the browser at once: past this, the canvas
@@ -391,8 +423,7 @@ export interface EnsureResult {
  * for edges joining loaded nodes. Over-approximates (eye banishes are
  * ignored); visibleSets does the exact filtering afterwards. The caller
  * republishes the store when `added`. */
-export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
-  const sg = current
+export async function ensureViewLoaded(view: View, sg: Loaded | null = current): Promise<EnsureResult> {
   const w = sg?.windowed
   if (!sg || !w) return { added: false, capped: false }
   let added = 0
@@ -407,8 +438,8 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
     if (!id.includes('|')) ids.add(id)
   }
   for (const e of w.loadedEdges.values()) if (e.type === SKEWER_EDGE) ids.add(e.to) // rail members
-  added += await ensureNodesByIds([...ids])
-  added += await ensureEdgesByKeyStrings([
+  added += await ensureNodesByIds(sg, [...ids])
+  added += await ensureEdgesByKeyStrings(sg, [
     ...(view.edgeOverrides ?? []),
     ...(view.focusShow ?? []).filter((k) => k.includes('|')),
     ...(view.focusHide ?? []).filter((k) => k.includes('|')),
@@ -457,7 +488,7 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
             layer.filter((i) => !w.loadedNodes.has(i)).slice(0, Math.max(0, room())),
           )
         }
-        added += await ensureNodesByInts(layer)
+        added += await ensureNodesByInts(sg, layer)
         for (const i of layer) seen.add(i)
         frontier = layer
         if (capped) break bfs
@@ -476,7 +507,7 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
         capped = true
         continue
       }
-      added += await ensureNodesByTypes([t])
+      added += await ensureNodesByTypes(sg, [t])
     }
   }
 
@@ -493,7 +524,7 @@ export async function ensureViewLoaded(view: View): Promise<EnsureResult> {
       const edge: EdgeT = outgoing
         ? { type: eType, from: node.id, to: other.id, data: {} }
         : { type: eType, from: other.id, to: node.id, data: {} }
-      addEdge(eInt, edge)
+      addEdge(sg, eInt, edge)
       added++
     }
   }

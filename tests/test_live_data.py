@@ -209,3 +209,35 @@ def test_duckdb_wasm_is_served_from_the_cache(tmp_path, monkeypatch, client):
     assert r.headers["content-type"] == "application/wasm"
     assert client.get("/duckdb/1.29.1/duckdb-eh.wasm").status_code == 502
     assert client.get("/data/graphs.json").json()["duckdbWasmBase"] == "duckdb/"
+
+
+def test_upserts_patch_type_and_results():
+    g = Graph.model_validate(
+        {"schema": {"nodeTypes": {"a": {}}, "edgeTypes": {"R": {"color": "#111"}}}, "nodes": [{"id": "a:1", "type": "a"}]}
+    )
+    res = apply_ops(
+        g,
+        [
+            {"op": "upsert_node", "id": "a:1", "type": "a", "set": {"x": 1}},
+            {"op": "upsert_node", "id": "a:2", "type": "a", "label": "two", "set": {"y": 2}},
+            {"op": "upsert_edge", "type": "R", "from": "a:1", "to": "a:2", "set": {"note": "n"}},
+            {"op": "upsert_edge", "type": "R", "from": "a:1", "to": "a:2", "set": {"more": 1}},
+            {"op": "patch_type", "kind": "edge", "name": "R", "set": {"flow": "fwd"}},
+            {"op": "patch_type", "kind": "node", "name": "b", "set": {"description": "bee"}},
+            {"op": "remove_edge", "type": "R", "from": "a:2", "to": "a:1", "missing_ok": True},
+            {"op": "remove_node", "id": "a:2"},
+        ],
+    )
+    assert [r["result"] for r in res] == [
+        "updated", "created", "created", "updated", "updated", "created", "unchanged", "removed",
+    ]
+    assert res[-1]["edges"] == 1
+    assert g.nodes[0].data == {"x": 1}
+    # patch_type keeps the fields it wasn't given.
+    assert g.graph_schema.edgeTypes["R"].color == "#111" and g.graph_schema.edgeTypes["R"].flow == "fwd"
+    assert g.graph_schema.nodeTypes["b"].description == "bee"
+
+
+def test_default_graph_ops_route(client):
+    r = client.post("/api/graph/ops", json={"ops": [{"op": "upsert_node", "id": "a:9", "type": "a"}]})
+    assert r.status_code == 200 and r.json()["results"] == [{"result": "created"}]

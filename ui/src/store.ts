@@ -10,9 +10,8 @@
 // (Skewer, Pin, Delete) via `multiNodes`.
 
 import { create } from 'zustand'
-import { createGraph, deleteGraph, fetchGraph, fetchGraphs, postOps, postSelection } from './api'
-import { diffOps } from './ops'
-import { capabilities, type Capabilities, hydrateDetails, staticGraph } from './static'
+import { createGraph, deleteGraph, fetchGraph, fetchGraphs, postSelection } from './api'
+import { capabilities, type Capabilities, hydrateDetails } from './static'
 import {
   alignGeom,
   computeBundleFracs,
@@ -37,7 +36,8 @@ export interface KgeState {
   graphId: string // which one `graph` is
   viewId: string
   caps: Capabilities // what the data source allows (static.ts); {} = read-only
-  dirty: boolean
+  dirty: boolean // edits not yet sent (they save themselves shortly; share.ts)
+  saving: boolean
   version: number
   primary: Sel | null
   secondary: Sel | null
@@ -53,7 +53,11 @@ export interface KgeState {
   stashedFocus: { foci: Focus[]; show: string[]; hide: string[] } | null // for Restore focus
 
   refresh: () => Promise<void>
+  /** Send unsaved edits now. (share.ts installs it: saving needs the
+   * reload machinery that lives there.) */
   save: () => Promise<void>
+  /** Save, then pull the server's current version in place. */
+  reload: () => Promise<void>
   /** Pull the full data behind a selected item (the loaded rows carry only
    * the lite fields rendering needs) so the inspector can show and edit it. */
   hydrateSel: (sel: Sel) => Promise<void>
@@ -141,6 +145,7 @@ export const useStore = create<KgeState>((set, get) => {
     viewId: 'default',
     caps: {},
     dirty: false,
+    saving: false,
     version: 0,
     primary: null,
     secondary: null,
@@ -181,28 +186,8 @@ export const useStore = create<KgeState>((set, get) => {
       }
     },
 
-    /** Send what changed as ops, then reload at the new version (integers
-     * renumber on every save, so the loaded rows can't be patched in place);
-     * the selection carries over by id. */
-    save: async () => {
-      const { graph: g, graphId } = get()
-      if (!g || !graphId) return
-      try {
-        const ops = diffOps(g)
-        if (!ops.length) return set({ dirty: false, status: 'nothing to save' })
-        const res = await postOps(graphId, ops, staticGraph()?.version ?? '')
-        const { primary, secondary } = get()
-        await get().refresh()
-        setSelection(primary, secondary)
-        set({
-          status:
-            `saved ${graphId}: ${ops.length} change${ops.length === 1 ? '' : 's'}` +
-            (res.moved ? ' (the graph had also changed on the server; reloaded with both)' : ''),
-        })
-      } catch (e) {
-        set({ status: String(e) })
-      }
-    },
+    save: async () => {},
+    reload: async () => {},
 
     hydrateSel: async (sel) => {
       if (await hydrateDetails(sel)) {

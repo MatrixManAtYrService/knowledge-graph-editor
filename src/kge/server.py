@@ -41,7 +41,7 @@ from pydantic import BaseModel
 
 from kge.cache import ParquetCache, duckdb_wasm, fingerprint
 from kge.models import Graph, SelectionState
-from kge.ops import OpError, apply_ops
+from kge.ops import apply_ops
 from kge.store import GraphRegistry, GraphStore
 
 # What this server lets the browser do; a static export offers none of it.
@@ -212,19 +212,21 @@ def create_app(
 
     @app.post("/api/graphs/{graph_id}/ops")
     def post_ops(graph_id: str, batch: OpBatch):
-        store = store_or_404(graph_id)
+        return apply_batch(store_or_404(graph_id), batch)
+
+    def apply_batch(store: GraphStore, batch: OpBatch) -> dict:
         with store.locked():
             before = fingerprint(store)
             graph = Graph.model_validate(load(store))
             try:
-                apply_ops(graph, batch.ops)
+                results = apply_ops(graph, batch.ops)
                 summary = store.save(graph)
             except ValueError as exc:  # OpError, or validate_semantics in save
                 raise HTTPException(400, str(exc))
             version = fingerprint(store)
         sync_site()
         moved = batch.base_version is not None and batch.base_version != before
-        return {"saved": True, "version": version, "moved": moved, **summary}
+        return {"saved": True, "version": version, "moved": moved, "results": results, **summary}
 
     @app.get("/api/graphs/{graph_id}/version")
     def graph_version(graph_id: str):
@@ -294,6 +296,10 @@ def create_app(
     @app.put("/api/graph")
     def put_graph(graph: Graph):
         return save(default_store(), graph)
+
+    @app.post("/api/graph/ops")
+    def post_default_ops(batch: OpBatch):
+        return apply_batch(default_store(), batch)
 
     @app.get("/api/selection")
     async def get_selection():

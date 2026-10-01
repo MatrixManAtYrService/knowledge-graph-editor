@@ -475,7 +475,10 @@ function layoutLaneBundle(args: {
  * look at beats a frozen tab. */
 const LAYOUT_BUDGET_MS = 10_000
 
-export async function runLayout(): Promise<void> {
+/** Lay out the current view. `persist: false` (a view's automatic first
+ * arrangement) leaves the result unsaved: merely opening a view must not
+ * write to the graph's files. It still saves along with the next real edit. */
+export async function runLayout(opts?: { persist?: boolean }): Promise<void> {
   const deadline = performance.now() + LAYOUT_BUDGET_MS
   const st = useStore.getState()
   const g = st.graph
@@ -907,10 +910,12 @@ export async function runLayout(): Promise<void> {
     if (!result.polished) unpolished++
   })
 
+  const wasDirty = useStore.getState().dirty
   for (const [sid, geom] of Object.entries(allGeoms)) {
     st.setSkewerGeom(sid, geom)
   }
   st.setPositions(allFree)
+  if (opts?.persist === false) useStore.setState({ dirty: wasDirty })
   fitAfterBuild.flag = true
   st.bump()
   const noun = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`
@@ -1686,7 +1691,7 @@ export function GraphCanvas() {
       firstBuild.current = false
       cy.fit(undefined, 60)
       const anySeeded = [...visN].some((id) => seed[id])
-      if (!anySeeded) void runLayout() // brand-new graph: give it a first arrangement
+      if (!anySeeded) void runLayout({ persist: false }) // brand-new graph: give it a first arrangement
       // Drawn from the saved layout: final now, with no "layout:" status to
       // wait for (scripts/ui_smoke.py waits on this or that).
       else divRef.current?.setAttribute('data-drawn', 'saved')

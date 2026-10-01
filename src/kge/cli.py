@@ -21,7 +21,7 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 
-from kge.models import FLOW_DIRECTIONS, Edge, Graph, Node, TypeDef
+from kge.models import FLOW_DIRECTIONS, Edge, Graph
 
 console = Console()
 app = typer.Typer(
@@ -50,7 +50,8 @@ DataOpt = Annotated[str, typer.Option("--data", help="Extra properties as a JSON
 
 
 def _fail(msg: str) -> typer.Exit:
-    console.print(f"[red]{msg}[/red]")
+    # Messages quote ids, which may look like markup or :emoji: codes.
+    console.print(f"[red]{escape(msg)}[/red]", emoji=False)
     return typer.Exit(1)
 
 
@@ -81,6 +82,22 @@ def _push(server: str, graph_id: str, graph: Graph) -> dict:
         detail = resp.json().get("detail", resp.text) if ct.startswith("application/json") else resp.text
         raise _fail(f"server rejected the save: {detail}")
     return resp.json()
+
+
+def _ops(server: str, graph_id: str, ops: list[dict]) -> list[dict]:
+    """Apply edit operations (all or nothing; see kge.ops). Each touches only
+    its own item, so concurrent writers — the browser, other agents — don't
+    clobber each other the way a whole-graph push would. Returns one result
+    per op."""
+    try:
+        resp = httpx.post(_graph_url(server, graph_id) + "/ops", json={"ops": ops}, timeout=60.0)
+    except httpx.HTTPError as exc:
+        raise _fail(f"can't reach the kge server at {server}: {exc}")
+    if resp.status_code >= 400:
+        ct = resp.headers.get("content-type", "")
+        detail = resp.json().get("detail", resp.text) if ct.startswith("application/json") else resp.text
+        raise _fail(f"server rejected the edit: {detail}")
+    return resp.json()["results"]
 
 
 def _parse_data(data: str) -> dict:
@@ -1049,19 +1066,9 @@ def add_node(
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Add (or update, if the id exists) a node."""
-    g = _fetch(server, graph)
     props = _parse_data(data)
-    existing = next((n for n in g.nodes if n.id == node_id), None)
-    if existing:
-        existing.type = type
-        if label:
-            existing.label = label
-        existing.data.update(props)
-        verb = "updated"
-    else:
-        g.nodes.append(Node(id=node_id, type=type, label=label, data=props))
-        verb = "added"
-    _push(server, graph, g)
+    [res] = _ops(server, graph, [{"op": "upsert_node", "id": node_id, "type": type, "label": label, "set": props}])
+    verb = "added" if res["result"] == "created" else "updated"
     console.print(f"{verb} {node_id} [dim]({type})[/dim]")
 
 
@@ -1072,14 +1079,8 @@ def rm_node(
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Remove a node and its incident edges (layout refs are pruned server-side)."""
-    g = _fetch(server, graph)
-    if not any(n.id == node_id for n in g.nodes):
-        raise _fail(f"no such node: {node_id}")
-    g.nodes = [n for n in g.nodes if n.id != node_id]
-    dropped = [e for e in g.edges if node_id in (e.src, e.dst)]
-    g.edges = [e for e in g.edges if node_id not in (e.src, e.dst)]
-    _push(server, graph, g)
-    console.print(f"removed {node_id} and {len(dropped)} incident edge(s)")
+    [res] = _ops(server, graph, [{"op": "remove_node", "id": node_id}])
+    console.print(f"removed {node_id} and {res['edges']} incident edge(s)")
 
 
 @app.command("add-edge")
@@ -1092,19 +1093,12 @@ def add_edge(
     graph: GraphOpt = DEFAULT_GRAPH,
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
-    """Add an edge. Both endpoints must already exist."""
-    g = _fetch(server, graph)
+    """Add an edge (or update its data, if it exists). Both endpoints must already exist."""
     props = _parse_data(data)
     if note:
         props["note"] = note
-    existing = next((e for e in g.edges if e.key == (type, src, dst)), None)
-    if existing:
-        existing.data.update(props)
-        verb = "updated"
-    else:
-        g.edges.append(Edge.model_validate({"type": type, "from": src, "to": dst, "data": props}))
-        verb = "added"
-    _push(server, graph, g)
+    [res] = _ops(server, graph, [{"op": "upsert_edge", "type": type, "from": src, "to": dst, "set": props}])
+    verb = "added" if res["result"] == "created" else "updated"
     console.print(f"{verb} {src} -[{type}]-> {dst}")
 
 
@@ -1117,12 +1111,7 @@ def rm_edge(
     server: ServerOpt = DEFAULT_SERVER,
 ) -> None:
     """Remove one edge."""
-    g = _fetch(server, graph)
-    before = len(g.edges)
-    g.edges = [e for e in g.edges if e.key != (type, src, dst)]
-    if len(g.edges) == before:
-        raise _fail(f"no such edge: {type} {src} -> {dst}")
-    _push(server, graph, g)
+    _ops(server, graph, [{"op": "remove_edge", "type": type, "from": src, "to": dst}])
     console.print(f"removed {src} -[{type}]-> {dst}")
 
 
@@ -1151,21 +1140,17 @@ def add_type(
         raise _fail("--flow applies to edge types only")
     if flow and flow not in (*FLOW_DIRECTIONS, "none"):
         raise _fail("--flow must be fwd, rev, or none")
-    g = _fetch(server, graph)
-    block = g.graph_schema.nodeTypes if kind == "node" else g.graph_schema.edgeTypes
-    td = block.get(name)
-    verb = "updated" if td else "added"
-    td = td or TypeDef()
+    fields: dict = {}
     if color:
-        td.color = color
+        fields["color"] = color
     if description:
-        td.description = description
+        fields["description"] = description
     if family:
-        td.family = family
+        fields["family"] = family
     if flow:
-        td.flow = None if flow == "none" else flow
-    block[name] = td
-    _push(server, graph, g)
+        fields["flow"] = None if flow == "none" else flow
+    [res] = _ops(server, graph, [{"op": "patch_type", "kind": kind, "name": name, "set": fields}])
+    verb = "added" if res["result"] == "created" else "updated"
     console.print(f"{verb} {kind} type {name}")
 
 
@@ -1203,38 +1188,34 @@ def skewer(
     """
     if len(members) < 2:
         raise _fail("a skewer needs at least 2 members")
+    # Which membership edges to replace depends on the current graph, so
+    # read it; the edit itself is one op batch (removals tolerate an edge
+    # someone else already removed).
     g = _fetch(server, graph)
     node_ids = {n.id for n in g.nodes}
     missing = [m for m in members if m not in node_ids]
     if missing:
         raise _fail(f"no such node(s): {', '.join(missing)}")
-    g.graph_schema.nodeTypes.setdefault(
-        "skewer", TypeDef(color="#9aa0a6", description="An ordered colinearity group (layout intent)")
-    )
-    g.graph_schema.edgeTypes.setdefault(
-        "skewer-order", TypeDef(color="#c9cdd2", description="Skewer membership; data.index gives the order")
-    )
-    node = next((n for n in g.nodes if n.id == skewer_id), None)
-    if node is None:
-        node = Node(id=skewer_id, type="skewer", label=label, data={})
-        g.nodes.append(node)
-    elif label:
-        node.label = label
-    if order_key:
-        node.data["orderKey"] = order_key
-    if group:
-        node.data["group"] = group
-    g.edges = [e for e in g.edges if not (e.type == "skewer-order" and e.src == skewer_id)]
+    ops: list[dict] = []
+    if "skewer" not in g.graph_schema.nodeTypes:
+        ops.append({"op": "patch_type", "kind": "node", "name": "skewer",
+                    "set": {"color": "#9aa0a6", "description": "An ordered colinearity group (layout intent)"}})
+    if "skewer-order" not in g.graph_schema.edgeTypes:
+        ops.append({"op": "patch_type", "kind": "edge", "name": "skewer-order",
+                    "set": {"color": "#c9cdd2", "description": "Skewer membership; data.index gives the order"}})
+    data = {k: v for k, v in (("orderKey", order_key), ("group", group)) if v}
+    ops.append({"op": "upsert_node", "id": skewer_id, "type": "skewer", "label": label, "set": data})
     member_set = set(members)
     moved = sorted(
-        {f"{e.dst} (from {e.src})" for e in g.edges if e.type == "skewer-order" and e.dst in member_set}
+        {f"{e.dst} (from {e.src})" for e in g.edges
+         if e.type == "skewer-order" and e.dst in member_set and e.src != skewer_id}
     )
-    g.edges = [e for e in g.edges if not (e.type == "skewer-order" and e.dst in member_set)]
+    for e in g.edges:
+        if e.type == "skewer-order" and (e.src == skewer_id or e.dst in member_set):
+            ops.append({"op": "remove_edge", "type": e.type, "from": e.src, "to": e.dst, "missing_ok": True})
     for i, m in enumerate(members):
-        g.edges.append(
-            Edge.model_validate({"type": "skewer-order", "from": skewer_id, "to": m, "data": {"index": i}})
-        )
-    _push(server, graph, g)
+        ops.append({"op": "create_edge", "type": "skewer-order", "from": skewer_id, "to": m, "data": {"index": i}})
+    _ops(server, graph, ops)
     console.print(f"skewer {skewer_id}: {' → '.join(members)}")
     if moved:
         console.print(f"[dim]moved off other skewers: {', '.join(moved)}[/dim]")

@@ -103,3 +103,116 @@ export function diffOps(g: GraphPayload): Op[] {
   for (const v of pristine.views) if (!views.has(v.id)) ops.push({ op: 'remove_view', id: v.id })
   return ops
 }
+
+/** Take `g` as the new saved state: later diffs show only edits made after
+ * this (a save in flight must not be sent twice). Returns an undo, for when
+ * the save never reached the server. */
+export function rebase(g: GraphPayload): () => void {
+  const sg = staticGraph()
+  if (!sg) return () => {}
+  const was = { base: sg.base, pristine: sg.pristine }
+  sg.base = {
+    nodes: new Map(g.nodes.map((n) => [n.id, structuredClone(n)])),
+    edges: new Map(g.edges.map((e) => [edgeKey(e), structuredClone(e)])),
+  }
+  sg.pristine = structuredClone({ ...g, nodes: [], edges: [] })
+  return () => {
+    sg.base = was.base
+    sg.pristine = was.pristine
+  }
+}
+
+/** Everything `ops` touch, so a reload can load it before replaying them. */
+export function opRefs(ops: Op[]): { nodes: string[]; edges: string[] } {
+  const nodes = new Set<string>()
+  const edges = new Set<string>()
+  for (const op of ops) {
+    if (typeof op.id === 'string' && op.op.endsWith('_node')) nodes.add(op.id)
+    if (typeof op.from === 'string' && typeof op.to === 'string') {
+      nodes.add(op.from)
+      nodes.add(op.to)
+      edges.add(edgeKey({ type: String(op.type), from: op.from, to: op.to }))
+    }
+  }
+  return { nodes: [...nodes], edges: [...edges] }
+}
+
+/** Replay `ops` onto `g` (in place) — local edits not yet saved, on top of a
+ * freshly reloaded graph. Mirrors src/kge/ops.py, except that an op the
+ * reloaded graph no longer fits (its node is gone, its id now taken) is
+ * dropped: the server's state wins. Returns how many were dropped. */
+export function applyOps(g: GraphPayload, ops: Op[]): number {
+  let dropped = 0
+  const nodeAt = (id: unknown) => g.nodes.findIndex((n) => n.id === id)
+  const edgeAt = (op: Op) =>
+    g.edges.findIndex((e) => e.type === op.type && e.from === op.from && e.to === op.to)
+  const patch = (data: Record<string, unknown>, op: Op) => {
+    const out = { ...data }
+    for (const k of (op.unset as string[] | undefined) ?? []) delete out[k]
+    return Object.assign(out, (op.set as Record<string, unknown> | undefined) ?? {})
+  }
+  for (const op of ops) {
+    switch (op.op) {
+      case 'create_node':
+        if (nodeAt(op.id) >= 0) dropped++
+        else g.nodes.push({ id: String(op.id), type: String(op.type), label: String(op.label ?? ''), data: (op.data as Record<string, unknown>) ?? {} })
+        break
+      case 'patch_node': {
+        const i = nodeAt(op.id)
+        if (i < 0) {
+          dropped++
+          break
+        }
+        const n = { ...g.nodes[i] }
+        if (op.type !== undefined) n.type = String(op.type)
+        if (op.label !== undefined) n.label = String(op.label)
+        n.data = patch(n.data, op)
+        g.nodes[i] = n
+        break
+      }
+      case 'remove_node':
+        if (nodeAt(op.id) < 0) dropped++
+        g.nodes = g.nodes.filter((n) => n.id !== op.id)
+        g.edges = g.edges.filter((e) => e.from !== op.id && e.to !== op.id)
+        break
+      case 'create_edge':
+        if (edgeAt(op) >= 0 || nodeAt(op.from) < 0 || nodeAt(op.to) < 0) dropped++
+        else g.edges.push({ type: String(op.type), from: String(op.from), to: String(op.to), data: (op.data as Record<string, unknown>) ?? {} })
+        break
+      case 'patch_edge': {
+        const i = edgeAt(op)
+        if (i < 0) dropped++
+        else g.edges[i] = { ...g.edges[i], data: patch(g.edges[i].data, op) }
+        break
+      }
+      case 'remove_edge': {
+        const i = edgeAt(op)
+        if (i < 0) dropped++
+        else g.edges.splice(i, 1)
+        break
+      }
+      case 'put_type':
+      case 'remove_type': {
+        const table = op.kind === 'node' ? g.schema.nodeTypes : g.schema.edgeTypes
+        if (op.op === 'put_type') table[String(op.name)] = structuredClone(op.def) as (typeof table)[string]
+        else delete table[String(op.name)]
+        break
+      }
+      case 'set_schema':
+        if ('colorKey' in op) g.schema.colorKey = op.colorKey as string
+        if ('colorValues' in op) g.schema.colorValues = op.colorValues as Record<string, string>
+        break
+      case 'put_view': {
+        const v = structuredClone(op.view) as GraphPayload['views'][number]
+        const i = g.views.findIndex((x) => x.id === v.id)
+        if (i >= 0) g.views[i] = v
+        else g.views.push(v)
+        break
+      }
+      case 'remove_view':
+        g.views = g.views.filter((v) => v.id !== op.id)
+        break
+    }
+  }
+  return dropped
+}

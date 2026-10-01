@@ -25,10 +25,20 @@
 //   no=4,11  eo=2               per-item include overrides
 //   sh=n3,e7  hd=...            eye adjustments (summon / banish)
 
-import { fetchVersion } from './api'
-import { drainLoaded, ensureInts, ensureViewLoaded, staticGraph, WINDOWED_LOAD_CAP } from './static'
+import { fetchVersion, postOps } from './api'
+import { applyOps, diffOps, type Op, opRefs, rebase } from './ops'
+import {
+  activate,
+  drainLoaded,
+  ensureIds,
+  ensureInts,
+  ensureViewLoaded,
+  loadGraph,
+  staticGraph,
+  WINDOWED_LOAD_CAP,
+} from './static'
 import { useStore } from './store'
-import type { EdgeT, Focus, NodeT, Sel, View } from './types'
+import type { EdgeT, Focus, GraphPayload, NodeT, Sel, View } from './types'
 import { edgeKey } from './types'
 
 const sameList = (a: string[] | null | undefined, b: string[] | null | undefined): boolean => {
@@ -401,27 +411,152 @@ async function resolveViewData(): Promise<void> {
   }
 }
 
-/** The graph changed on the server (an agent's edit, a sync, git pull):
- * reload it where you are, or with unsaved edits, say so and let Refresh
- * decide. */
+// -- saving and reloading -----------------------------------------------------
+//
+// There is no Save button: every edit is applied locally at once (the store
+// mutates) and sent as ops shortly after (debounced, so a drag is one save,
+// not hundreds). A save rebases first — the sent ops become the saved state,
+// so edits made while it's in flight diff cleanly into the next one — and
+// then reloads, because integers renumber with every version.
+//
+// A reload never blanks the canvas: the new version loads in the
+// background (what the view shows, plus whatever unsaved edits touch), the
+// unsaved edits replay on top, and only then does it swap in. The same
+// reload picks up outside changes (agents, syncs, git pull) when the version
+// poll notices them.
+
+const SAVE_DEBOUNCE_MS = 700
+const VERSION_POLL_MS = 5000
+
+let saveTimer: ReturnType<typeof setTimeout> | undefined
+let saving: Promise<void> | null = null
+let reloading: Promise<void> | null = null
+
+function scheduleSave(): void {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => void saveNow(), SAVE_DEBOUNCE_MS)
+}
+
+/** Send unsaved edits now (and wait for the reload after). */
+async function saveNow(): Promise<void> {
+  clearTimeout(saveTimer)
+  while (saving) await saving
+  const st = useStore.getState()
+  const sg = staticGraph()
+  if (!st.dirty || !st.caps.write || !st.graph || !sg) return
+  const ops = diffOps(st.graph)
+  if (!ops.length) {
+    useStore.setState({ dirty: false })
+    return
+  }
+  saving = (async () => {
+    const graphId = st.graphId
+    const undo = rebase(st.graph!)
+    useStore.setState({ dirty: false, saving: true })
+    try {
+      const res = await postOps(graphId, ops, sg.version)
+      await reloadInPlace()
+      const n = `${ops.length} change${ops.length === 1 ? '' : 's'}`
+      useStore
+        .getState()
+        .setStatus(`saved ${n}` + (res.moved ? ' (merged with changes made elsewhere)' : ''))
+    } catch (e) {
+      if (e instanceof TypeError) {
+        // Never reached the server: keep the edits unsaved and retry later.
+        undo()
+        useStore.setState({ dirty: true })
+        useStore.getState().setStatus(`couldn't reach the server to save (${e.message}); will retry`)
+        saveTimer = setTimeout(() => void saveNow(), 5 * SAVE_DEBOUNCE_MS)
+      } else {
+        // Rejected: drop those edits (the reload shows the server's state).
+        useStore.getState().setStatus(`${e} — those edits were undone`)
+        await reloadInPlace().catch(() => {})
+      }
+    } finally {
+      useStore.setState({ saving: false })
+    }
+  })()
+  try {
+    await saving
+  } finally {
+    saving = null
+  }
+  if (useStore.getState().dirty) scheduleSave()
+}
+
+/** Swap in the graph's current version without blanking the canvas,
+ * replaying unsaved local edits on top. */
+async function reloadInPlace(): Promise<void> {
+  if (reloading) return reloading
+  reloading = (async () => {
+    const { graphId } = useStore.getState()
+    const next = await loadGraph(graphId)
+    // Load what the view shows (as edited locally) plus what pending edits
+    // and the selection touch; repeat if edits landed meanwhile.
+    let pending: Op[] = []
+    let graph = useStore.getState().graph
+    for (let i = 0; i < 3; i++) {
+      graph = useStore.getState().graph
+      const st = useStore.getState()
+      if (!graph) return
+      pending = diffOps(graph)
+      const refs = opRefs(pending)
+      for (const sel of [st.primary, st.secondary]) {
+        if (sel?.kind === 'edge') refs.edges.push(sel.id)
+        else if (sel) refs.nodes.push(sel.id)
+      }
+      await ensureIds(refs.nodes, refs.edges, next)
+      const view = graph.views.find((v) => v.id === st.viewId) ?? graph.views[0]
+      if (view) await ensureViewLoaded(view, next)
+      if (useStore.getState().graph === graph) break
+    }
+    const rows = drainLoaded(next)
+    const fresh: GraphPayload = structuredClone({ ...next.payload, nodes: [], edges: [] })
+    fresh.nodes = [...next.payload.nodes, ...rows.nodes].sort(byNode)
+    fresh.edges = [...next.payload.edges, ...rows.edges].sort(byEdge)
+    const dropped = applyOps(fresh, pending)
+    fresh.nodes.sort(byNode)
+    fresh.edges.sort(byEdge)
+    activate(next)
+    useStore.setState((s) => ({
+      graph: fresh,
+      version: s.version + 1,
+      // Still unsaved = edited since the last save went out (an automatic
+      // layout's positions replay, but don't by themselves trigger a save).
+      dirty: s.dirty,
+      primary: s.primary && present(fresh, s.primary) ? s.primary : null,
+      secondary: s.secondary && present(fresh, s.secondary) ? s.secondary : null,
+    }))
+    if (dropped) {
+      useStore
+        .getState()
+        .setStatus(`${dropped} unsaved edit${dropped === 1 ? '' : 's'} no longer fit the graph and were dropped`)
+    }
+  })()
+  try {
+    await reloading
+  } finally {
+    reloading = null
+  }
+}
+
+const present = (g: GraphPayload, sel: Sel): boolean =>
+  sel.kind === 'edge' ? g.edges.some((e) => edgeKey(e) === sel.id) : g.nodes.some((n) => n.id === sel.id)
+
+/** The graph changed on the server (an agent's edit, a sync, git pull)?
+ * Reload in place; unsaved edits replay on top. */
 async function checkVersion(): Promise<void> {
   const st = useStore.getState()
   const sg = staticGraph()
-  if (!sg?.version || !st.caps.write || !st.graphId) return
+  if (!sg?.version || !st.caps.write || !st.graphId || saving || reloading) return
   let now: string
   try {
     now = await fetchVersion(st.graphId)
   } catch {
-    return // server away: the next focus tries again
+    return // server away: the next check tries again
   }
-  if (now === staticGraph()?.version) return
-  if (useStore.getState().dirty) {
-    st.setStatus('the graph changed on the server — Save to merge your edits in, or Refresh to drop them')
-    return
-  }
-  const { primary, secondary } = useStore.getState()
-  await useStore.getState().refresh()
-  useStore.setState({ primary, secondary })
+  if (now === staticGraph()?.version || saving || reloading) return
+  await reloadInPlace()
   useStore.getState().setStatus('the graph changed on the server — reloaded')
 }
 
@@ -442,7 +577,10 @@ export async function initShare(): Promise<void> {
   } finally {
     applying = false
   }
-  useStore.subscribe(() => {
+  useStore.setState({ save: saveNow, reload: () => saveNow().then(reloadInPlace) })
+  useStore.subscribe((s, prev) => {
+    // Any edit while there are unsaved ones restarts the save countdown.
+    if (s.dirty && s.graph !== prev.graph) scheduleSave()
     if (applying) return
     scheduleWrite()
     void resolveViewData()
@@ -451,6 +589,11 @@ export async function initShare(): Promise<void> {
     if (!applying) void applyFromLocation()
   })
   window.addEventListener('focus', () => void checkVersion())
+  setInterval(() => {
+    if (document.visibilityState === 'visible') void checkVersion()
+  }, VERSION_POLL_MS)
+  // Leaving with edits still in the debounce window: send them now.
+  window.addEventListener('pagehide', () => void saveNow())
   await resolveViewData()
   writeHashNow()
 }

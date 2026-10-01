@@ -502,6 +502,17 @@ button.mini.toggled-on {
   font-size: 11px;
 }
 
+.save-state {
+  color: #15803d;
+  font-size: 11px;
+  min-width: 52px;
+  white-space: nowrap;
+}
+
+.save-state.pending {
+  color: #888;
+}
+
 .ro-badge {
   color: #92400e;
   background: #fef3c7;
