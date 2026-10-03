@@ -441,7 +441,8 @@ def sql(
     key is the share-URL integer: good for one version of the graph only.
 
     For "exactly what does saved view X show", use `kge views X` — focus
-    and eye resolution live there. For flow questions ("what does X
+    and eye resolution live there; `kge add-view ID --sql QUERY` saves a
+    query's nodes as a view. For flow questions ("what does X
     reach?") use `kge reaches` / `kge reached-by`. sql is for everything
     else: ad-hoc structure questions, sweeps over data.
     """
@@ -455,20 +456,24 @@ def sql(
         raise _fail(str(exc))
     if rel is None:
         return  # a statement with no result set
-    if fmt == "table":
-        rel.show()
-    elif fmt == "json":
+    if fmt not in ("table", "json", "csv"):
+        raise _fail("--format must be table, json, or csv")
+    try:  # many errors (bad casts, ...) only surface while rows are produced
+        if fmt == "table":
+            rel.show()
+            return
         cols = [d[0] for d in rel.description]
-        print(json.dumps([dict(zip(cols, row)) for row in rel.fetchall()], indent=2, default=str))
-    elif fmt == "csv":
+        rows = rel.fetchall()
+    except duckdb.Error as exc:
+        raise _fail(str(exc))
+    if fmt == "json":
+        print(json.dumps([dict(zip(cols, row)) for row in rows], indent=2, default=str))
+    else:
         import csv
 
-        cols = [d[0] for d in rel.description]
         writer = csv.writer(sys.stdout)
         writer.writerow(cols)
-        writer.writerows(rel.fetchall())
-    else:
-        raise _fail("--format must be table, json, or csv")
+        writer.writerows(rows)
 
 
 @app.command()
@@ -562,7 +567,9 @@ repo serves several, graph/ when it serves one)
     optional k-hop foci (several may coexist; their neighborhoods union)
     with manual show/hide adjustments, and all layout
     geometry. `kge views` lists them; `kge views <id>` resolves one to
-    exactly what it displays.
+    exactly what it displays. `kge add-view <id>` saves one from types
+    (-t), nodes (-n), a query (--sql) and foci (--focus), and prints the
+    link that opens it; `kge rm-view` deletes one.
 
 [bold]Working with the human's attention[/bold]
 
@@ -594,6 +601,8 @@ repo serves several, graph/ when it serves one)
     kge sql "SELECT type, count(*) FROM nodes GROUP BY 1"
     kge sql "SELECT id, label FROM nodes WHERE data->>'actor' = 'Jia Tan'"
     kge sql "SELECT src, dst FROM edges WHERE type = 'MERGED_AS'"
+    kge sql "SELECT src FROM edges WHERE type = 'CALLS' AND (data->>'per') = 'x'"
+      # ->> binds looser than AND/=: parenthesize it inside a larger WHERE
     kge sql -g other-graph -f json "SELECT ... "   # pick graph; json/csv out
 
   Tables per graph: <graph>_nodes/_edges/_ids, with bare nodes/edges/ids
@@ -608,14 +617,15 @@ repo serves several, graph/ when it serves one)
   server with --site-dir so saves do it); same tables and columns.
 
   "What does saved view X show" belongs to `kge views X`, which applies the
-  focus/eye resolution SQL doesn't know about.
+  focus/eye resolution SQL doesn't know about. To turn a query's result
+  into a view the human can open: kge add-view <id> --sql "SELECT id ...".
 
 [bold]Reading and editing[/bold]
 
   read:  status · graphs · ls · show · types · views · selection ·
          find-collisions · reaches · reached-by · path · dump · sql
   edit:  add-graph · add-node · rm-node · add-edge · rm-edge · add-type ·
-         skewer · load
+         skewer · add-view · rm-view · load
 
   `kge dump > g.json`, edit, `kge load g.json` for bulk changes (whole-state
   replace — see the exception above). The files under graph/ are ordinary
@@ -972,6 +982,154 @@ def views(
         console.print(f"[dim]not shown: {len(hidden)} node(s): {', '.join(sorted(hidden))}[/dim]")
 
 
+def _sql_ids(server: str, graph: str, query_text: str) -> list[str]:
+    """Node ids a query returns: its `id` column, else its first column."""
+    import duckdb
+
+    conn = _live_conn(server, graph)
+    try:
+        rel = conn.sql(query_text)
+    except duckdb.Error as exc:
+        raise _fail(f"--sql: {exc}")
+    if rel is None:
+        raise _fail("--sql must be a SELECT that returns node ids")
+    cols = [d[0] for d in rel.description]
+    col = cols.index("id") if "id" in cols else 0
+    try:
+        rows = rel.fetchall()
+    except duckdb.Error as exc:
+        raise _fail(f"--sql: {exc}")
+    return [str(row[col]) for row in rows if row[col] is not None]
+
+
+@app.command("add-view")
+def add_view(
+    view_id: Annotated[str, typer.Argument(help="Id for the view (also its file name)")],
+    name: Annotated[str, typer.Option("--name", help="Display name (default: the id)")] = "",
+    node_types: Annotated[
+        list[str] | None,
+        typer.Option("--node-type", "-t", help="Include nodes of this type (repeatable)"),
+    ] = None,
+    edge_types: Annotated[
+        list[str] | None,
+        typer.Option("--edge-type", "-e", help="Show only edges of this type (repeatable; default: all)"),
+    ] = None,
+    node_ids: Annotated[
+        list[str] | None,
+        typer.Option("--node", "-n", help="Include this node (repeatable)"),
+    ] = None,
+    sql_query: Annotated[
+        str,
+        typer.Option(
+            "--sql",
+            help="Include the nodes this query returns (its `id` column, else its first); "
+            "same tables as `kge sql`",
+        ),
+    ] = "",
+    foci: Annotated[
+        list[str] | None,
+        typer.Option("--focus", help="Focus center as NODE or NODE:HOPS (default 2 hops; repeatable)"),
+    ] = None,
+    replace: Annotated[
+        bool, typer.Option("--replace", help="Overwrite an existing view (its layout is kept)")
+    ] = False,
+    graph: GraphOpt = DEFAULT_GRAPH,
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """Save a view: which nodes and edges it shows, optionally focused.
+
+    Nodes come from --node-type (whole types, so later additions of that
+    type show up too) plus --node / --sql (exactly those nodes — a
+    snapshot: re-run with --replace to refresh it). With none of these the
+    view includes every node. Edges show between shown nodes, limited to
+    --edge-type if given. --focus then narrows to k-hop neighborhoods.
+
+    \b
+      kge add-view billing -t table -t handler
+      kge add-view hot-writes --sql "SELECT dst AS id FROM edges WHERE data->>'per' = 'entity'"
+      kge add-view around-cos --focus service:cos:1 --replace
+
+    Prints the browser link that opens it; `kge views ID` shows what it holds.
+    """
+    from kge import geometry
+    from kge.models import Focus, View
+
+    g = _fetch(server, graph)
+    existing = next((v for v in g.views if v.id == view_id), None)
+    if existing is not None and not replace:
+        raise _fail(f"view {view_id} already exists (pass --replace to overwrite it)")
+
+    known_types = set(g.graph_schema.nodeTypes)
+    bad = [t for t in node_types or [] if t not in known_types]
+    bad += [t for t in edge_types or [] if t not in g.graph_schema.edgeTypes]
+    if bad:
+        raise _fail(f"unknown type(s): {', '.join(bad)} (kge types lists them)")
+
+    picked = list(node_ids or [])
+    if sql_query:
+        from_sql = _sql_ids(server, graph, sys.stdin.read() if sql_query.strip() == "-" else sql_query)
+        if not from_sql:
+            raise _fail("--sql returned no rows, so the view would be empty")
+        picked += from_sql
+    node_type = {n.id: n.type for n in g.nodes}
+    missing = sorted({i for i in picked if i not in node_type})
+    if missing:
+        raise _fail(f"no such node(s): {', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else ""))
+
+    focus_list = []
+    for f in foci or []:
+        # Ids contain colons too: a whole-string match is a node, not NODE:HOPS.
+        node, _, hops = f.rpartition(":")
+        if f in node_type or not hops.isdigit():
+            node, hops = f, ""
+        if node not in node_type:
+            raise _fail(f"no such focus node: {node}")
+        focus_list.append(Focus(node=node, kHops=int(hops) if hops else 2))
+
+    # A node shows iff its type is checked XOR it's overridden, so explicit
+    # nodes are overrides only where their type isn't already checked.
+    if picked and not node_types:
+        visible_nodes: list[str] | None = []
+    else:
+        visible_nodes = sorted(set(node_types)) if node_types else None
+    checked = known_types if visible_nodes is None else set(visible_nodes)
+    overrides = sorted({i for i in picked if node_type[i] not in checked})
+
+    view = View(
+        id=view_id,
+        name=name or (existing.name if existing else view_id),
+        visibleNodeTypes=visible_nodes,
+        visibleEdgeTypes=sorted(set(edge_types)) if edge_types else None,
+        nodeOverrides=overrides,
+        foci=focus_list,
+    )
+    # A focus outside the view's nodes is silently ignored when the view
+    # renders — say so now, while the fix is one flag away.
+    included = geometry.visible_sets(g, view.model_copy(update={"foci": []}))[0]
+    outside = [f.node for f in focus_list if f.node not in included]
+    if outside:
+        raise _fail(f"focus not among the view's nodes: {', '.join(outside)} (include it with -t or -n)")
+    if existing is not None:
+        view.layout, view.skewerGroups = existing.layout, existing.skewerGroups
+    _ops(server, graph, [{"op": "put_view", "view": view.model_dump(mode="json")}])
+
+    nodes, edges = geometry.visible_sets(g, view)
+    verb = "replaced" if existing else "created"
+    console.print(f"{verb} view {view_id}: {len(nodes)} nodes / {len(edges)} edges")
+    console.print(f"open it: {server}/#{'g=' + graph + '&' if graph else ''}v={view_id}")
+
+
+@app.command("rm-view")
+def rm_view(
+    view_id: Annotated[str, typer.Argument(help="View to delete")],
+    graph: GraphOpt = DEFAULT_GRAPH,
+    server: ServerOpt = DEFAULT_SERVER,
+) -> None:
+    """Delete a saved view (the graph itself is untouched)."""
+    _ops(server, graph, [{"op": "remove_view", "id": view_id}])
+    console.print(f"removed view {view_id}")
+
+
 @app.command("find-collisions")
 def find_collisions(
     of: Annotated[
@@ -1243,6 +1401,68 @@ def load(
     g = Graph.model_validate(json.loads(raw))
     summary = _push(server, graph, g)
     console.print(f"saved: {summary}")
+
+
+# -- embedding ----------------------------------------------------------------
+
+
+def command_names() -> list[str]:
+    """Every kge command, by its CLI name."""
+    return [c.name or c.callback.__name__.replace("_", "-") for c in app.registered_commands]
+
+
+# Mounted commands' help, as kge wrote it, and where each now lives — so
+# every mount can re-point "kge <command>" mentions at the host's spelling,
+# including mentions of commands another group mounted.
+_mounted: list[tuple[typer.models.CommandInfo, str]] = []
+_invocations: dict[str, str] = {}
+
+
+def _rehome(text: str) -> str:
+    import re
+
+    return re.sub(r"\bkge ([a-z][a-z-]*)", lambda m: _invocations.get(m.group(1), m.group(0)), text)
+
+
+def mount(
+    target: typer.Typer, commands: list[str], *, prog: str = "", server: str = "", graph: str = ""
+) -> None:
+    """Register kge commands on another Typer app, under the host's defaults.
+
+    A project that keeps its graph in kge can give its users one CLI: mount
+    the kge commands it wants into its own groups, defaulting --server and
+    --graph to its server and graph so nobody has to set $KGE_SERVER_URL /
+    $KGE_GRAPH or know kge is underneath. The flags still override. `prog`
+    is how the host spells the group ("ekg query"); help text that says
+    `kge <command>` is rewritten to it for every command mounted so far.
+
+        from kge.cli import mount
+        mount(query_app, ["ls", "show", "sql"], prog="mine query", server=URL, graph="mine")
+    """
+    import functools
+    import inspect
+
+    by_name = {n: c for n, c in zip(command_names(), app.registered_commands)}
+    unknown = [n for n in commands if n not in by_name]
+    if unknown:
+        raise ValueError(f"no such kge command(s): {', '.join(unknown)}")
+    defaults = {k: v for k, v in (("server", server), ("graph", graph)) if v}
+    for name in commands:
+        fn = by_name[name].callback
+        sig = inspect.signature(fn, eval_str=True)  # Typer needs the real Annotated types
+        params = [p.replace(default=defaults[p.name]) if p.name in defaults else p for p in sig.parameters.values()]
+
+        @functools.wraps(fn)
+        def wrapper(*args, __fn=fn, **kwargs):
+            return __fn(*args, **kwargs)
+
+        wrapper.__signature__ = sig.replace(parameters=params)  # type: ignore[attr-defined]
+        target.command(name)(wrapper)
+        _mounted.append((target.registered_commands[-1], by_name[name].help or inspect.getdoc(fn) or ""))
+        if prog:
+            _invocations[name] = f"{prog} {name}"
+    for info, original in _mounted:
+        info.help = _rehome(original)
 
 
 def main() -> None:

@@ -1,6 +1,6 @@
 [project]
 name = "kge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Knowledge graph editor - JSON files in git, FastAPI server, browser UI for humans, CLI for agents"
 requires-python = ">=3.12"
 dependencies = [
