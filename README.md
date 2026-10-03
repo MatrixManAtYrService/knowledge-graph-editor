@@ -51,6 +51,20 @@ server downloads once from jsdelivr. On a network that can't reach jsdelivr,
 set `KGE_DUCKDB_WASM_SOURCE` to a mirror, as a URL template with `{version}`
 and `{name}`.
 
+If that tool has its own CLI, it can carry kge's commands, so its users
+never need a second CLI or `KGE_*` variables. `mount` registers the commands
+you pick under your own groups, defaulting `--server` and `--graph` to yours,
+and rewrites `kge <command>` in their help to your spelling:
+
+```python
+from kge.cli import mount
+
+mount(query_app, ["ls", "show", "reaches", "reached-by", "sql", "views"],
+      prog="mytool query", server=MY_SERVER_URL, graph="mygraph")
+mount(graph_app, ["add-edge", "rm-edge", "add-view", "rm-view"],
+      prog="mytool graph", server=MY_SERVER_URL, graph="mygraph")
+```
+
 ## Working with an agent
 
 Point your agent at:
@@ -61,7 +75,10 @@ uv run kge --help       # every subcommand has its own --help
 ```
 
 The CLI can do everything the UI does: add and remove nodes, edges, and types,
-list saved views, and dump or load the whole graph. `kge selection` tells the
+save and list views, and dump or load the whole graph. To show you a subset,
+an agent can save it as a view and hand you the link:
+`kge add-view hot --sql "SELECT id FROM nodes WHERE ..."` prints a URL that
+opens exactly those nodes. `kge selection` tells the
 agent what you've clicked on, so you can ask about "this node" or "these two."
 
 You and the agent can edit at the same time. There's no Save button: the
